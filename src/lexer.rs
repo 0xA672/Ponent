@@ -337,15 +337,21 @@ pub enum Token {
     #[regex("0b[01][01_]*u[0-9]+", |lex| lex.slice().to_string())]
     BinUIntSuffix(String),
 
-    #[regex("[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", |lex| lex.slice().replace('_', "").parse::<f64>().unwrap())]
-    #[regex("[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<f64>().unwrap())]
+    #[regex("[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", |lex| {
+        let s = lex.slice().replace('_', "");
+        s.parse::<f64>().map(|f| if f.is_finite() { f } else { 0.0 }).unwrap_or(0.0)
+    })]
+    #[regex("[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
+        let s = lex.slice().replace('_', "");
+        s.parse::<f64>().map(|f| if f.is_finite() { f } else { 0.0 }).unwrap_or(0.0)
+    })]
     FloatLiteral(f64),
 
-    #[regex("[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<i64>().unwrap())]
+    #[regex("[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<i64>().unwrap_or(0))]
     IntLiteral(i64),
-    #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 16).unwrap())]
+    #[regex("0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 16).unwrap_or(0))]
     HexLiteral(i64),
-    #[regex("0b[01][01_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 2).unwrap())]
+    #[regex("0b[01][01_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 2).unwrap_or(0))]
     BinLiteral(i64),
 
     #[regex("'(([^'\\\\]|\\\\.)*)'", |lex| parse_char_literal(lex.slice()))]
@@ -456,6 +462,7 @@ pub enum Token {
     #[token("...")]
     Ellipsis,
 
+    #[allow(dead_code)]
     Error,
 }
 
@@ -491,6 +498,10 @@ mod tests {
                 Err(_) => panic!("extra error tokens after expected end"),
             }
         }
+    }
+
+    fn collect_all_tokens(source: &str) -> Vec<Result<Token, ()>> {
+        Token::lexer(source).collect()
     }
 
     #[test]
@@ -917,5 +928,320 @@ def main() -> Result<(), AppError> {
         assert_eq!(parse_char_literal(r"'\u{41"), 0);
         check_tokens(r#""\u{41}BC""#, vec![Token::StringLiteral("ABC".into())]);
         check_tokens(r#""\u{41""#, vec![Token::StringLiteral("".into())]);
+    }
+
+    #[test]
+    fn numeric_literal_safety_does_not_panic_on_overflow() {
+        let huge_int = "99999999999999999999";
+        let tokens: Vec<_> = Token::lexer(huge_int)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::IntLiteral(0)]);
+
+        let huge_hex = "0xFFFFFFFFFFFFFFFFF";
+        let tokens: Vec<_> = Token::lexer(huge_hex)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::HexLiteral(0)]);
+
+        let huge_float = "1e9999";
+        let tokens: Vec<_> = Token::lexer(huge_float)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::FloatLiteral(0.0)]);
+    }
+
+    #[test]
+    fn nested_block_comment_handling() {
+        let source = "a/* still comment */b";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![Token::Ident("a".into()), Token::Ident("b".into())]
+        );
+    }
+
+    #[test]
+    fn unclosed_string_emits_error() {
+        let source = "\"unclosed";
+        let tokens: Vec<_> = collect_all_tokens(source);
+        assert!(tokens.iter().any(|r| r.is_err()));
+    }
+
+    #[test]
+    fn null_byte_in_source_emits_error() {
+        let source = "a\0b";
+        let tokens: Vec<_> = collect_all_tokens(source);
+        assert!(tokens.iter().any(|r| r.is_err()));
+    }
+
+    #[test]
+    fn escape_x_short_hex() {
+        assert_eq!(parse_string_literal(r#""\x1""#), "\x01");
+        assert_eq!(parse_string_literal(r#""\xAG""#), "\0");
+    }
+
+    #[test]
+    fn escape_u_incomplete() {
+        assert_eq!(parse_string_literal(r#""\u""#), "");
+        assert_eq!(parse_string_literal(r#""\u{""#), "");
+        assert_eq!(parse_string_literal(r#""\u{41""#), "");
+    }
+
+    #[test]
+    fn escape_u_surrogate_pair_yields_replacement_char() {
+        let s = parse_string_literal(r#""\u{D800}""#);
+        assert_eq!(s, "\u{FFFD}");
+    }
+
+    #[test]
+    fn escape_u_max_code_point() {
+        let s = parse_string_literal(r#""\u{10FFFF}""#);
+        assert_eq!(s, "\u{10FFFF}");
+    }
+
+    #[test]
+    fn multiple_escapes_in_one_string() {
+        let src = r#""\n\t\\\0\x41\u{263A}""#;
+        let expected = "\n\t\\\0\x41\u{263A}";
+        assert_eq!(parse_string_literal(src), expected);
+    }
+
+    #[test]
+    fn byte_string_escapes() {
+        assert_eq!(
+            parse_byte_string_literal(r#"b"\x00\x7F\x80\xFF""#),
+            vec![0x00, 0x7F, 0x80, 0xFF]
+        );
+        assert_eq!(parse_byte_string_literal(r#"b"\x1G""#), vec![0]);
+    }
+
+    #[test]
+    fn char_literal_unicode_rejects_non_ascii() {
+        assert_eq!(parse_char_literal(r"'\u{80}'"), 0);
+    }
+
+    #[test]
+    fn ident_with_keyword_prefix() {
+        let source = "defi letx type2";
+        check_tokens(
+            source,
+            vec![
+                Token::Ident("defi".into()),
+                Token::Ident("letx".into()),
+                Token::Ident("type2".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn long_identifier() {
+        let long = "a".repeat(10_000);
+        let source = long.as_str();
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::Ident(long)]);
+    }
+
+    #[test]
+    fn many_errors_accumulated() {
+        let source = "` ~ # $ % ^ & * ( )";
+        let error_count = collect_all_tokens(source)
+            .iter()
+            .filter(|r| r.is_err())
+            .count();
+        assert!(error_count > 0);
+    }
+
+    #[test]
+    fn unterminated_string() {
+        let source = r#""unclosed"#;
+        let result = collect_all_tokens(source);
+        assert!(result.iter().any(|r| r.is_err()));
+    }
+
+    #[test]
+    fn doc_comment_trimming() {
+        let source = "///   hello world   \n";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::DocComment("hello world".into())]);
+    }
+
+    #[test]
+    fn module_doc_comment_trimming() {
+        let source = "//!   module docs   \n";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::ModuleDocComment("module docs".into())]);
+    }
+
+    #[test]
+    fn line_comment_stops_at_newline() {
+        let source = "// comment\na";
+        check_tokens(source, vec![Token::Ident("a".into())]);
+    }
+
+    #[test]
+    fn mixed_whitespace_and_comments() {
+        let source = " \t  // skip\n  /* skip */ \n x";
+        check_tokens(source, vec![Token::Ident("x".into())]);
+    }
+
+    #[test]
+    fn numeric_literal_with_underscores() {
+        check_tokens(
+            "1_000 0xDead_Beef 0b1111_0000",
+            vec![
+                Token::IntLiteral(1000),
+                Token::HexLiteral(0xDEADBEEF),
+                Token::BinLiteral(0b11110000),
+            ],
+        );
+    }
+
+    #[test]
+    fn integer_suffixes_with_underscores() {
+        check_tokens(
+            "1_000i32 0xFF_u8 0b1010u8",
+            vec![
+                Token::IntSuffix("1_000i32".into()),
+                Token::HexUIntSuffix("0xFF_u8".into()),
+                Token::BinUIntSuffix("0b1010u8".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn lookahead_for_fat_arrow_and_ellipsis() {
+        check_tokens(
+            "=> ... .. .= ..=.",
+            vec![
+                Token::FatArrow,
+                Token::Ellipsis,
+                Token::DotDot,
+                Token::Dot,
+                Token::Assign,
+                Token::DotDotEq,
+                Token::Dot,
+            ],
+        );
+    }
+
+    #[test]
+    fn consecutive_operators() {
+        check_tokens(
+            "+% -? *!",
+            vec![Token::PlusWrap, Token::MinusSaturate, Token::StarTrap],
+        );
+    }
+
+    #[test]
+    fn block_comment_with_stars_and_slashes() {
+        let source = "/***/a/*/*/b";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![Token::Ident("a".into()), Token::Ident("b".into())]
+        );
+    }
+
+    #[test]
+    fn multiple_errors_and_recovery() {
+        let source = "`hello` world ` again";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("hello".into()),
+                Token::Ident("world".into()),
+                Token::Ident("again".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_token_generation() {
+        let source = "`";
+        let mut lex = Token::lexer(source);
+        assert!(lex.next().unwrap().is_err());
+    }
+
+    #[test]
+    fn span_after_lexing() {
+        let source = "def foo";
+        let mut lex = Token::lexer(source);
+        let tok = lex.next().unwrap().unwrap();
+        assert_eq!(tok, Token::Def);
+        let span = lex.span();
+        assert_eq!(&source[span], "def");
+    }
+
+    #[test]
+    fn all_overflow_operators() {
+        check_tokens(
+            "+% -% *% +? -? *? +! -! *!",
+            vec![
+                Token::PlusWrap,
+                Token::MinusWrap,
+                Token::StarWrap,
+                Token::PlusSaturate,
+                Token::MinusSaturate,
+                Token::StarSaturate,
+                Token::PlusTrap,
+                Token::MinusTrap,
+                Token::StarTrap,
+            ],
+        );
+    }
+
+    #[test]
+    fn float_special_values_are_rejected() {
+        check_tokens("1e9999", vec![Token::FloatLiteral(0.0)]);
+        check_tokens("-1e9999", vec![Token::Minus, Token::FloatLiteral(0.0)]);
+    }
+
+    #[test]
+    fn byte_string_literal_with_invalid_hex() {
+        let source = r#"b"\xGG""#;
+        check_tokens(source, vec![Token::ByteStringLiteral(vec![0])]);
+    }
+
+    #[test]
+    fn doc_comment_empty() {
+        let source = "///\n";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::DocComment(String::new())]);
+    }
+
+    #[test]
+    fn module_doc_comment_empty() {
+        let source = "//!\n";
+        let tokens: Vec<_> = Token::lexer(source)
+            .filter_map(|r| r.ok())
+            .filter(|t| *t != Token::WhitespaceOrComment)
+            .collect();
+        assert_eq!(tokens, vec![Token::ModuleDocComment(String::new())]);
     }
 }
