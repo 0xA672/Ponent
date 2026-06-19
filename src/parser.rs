@@ -6,6 +6,8 @@ pub struct Parser<'source> {
     lexer: logos::Lexer<'source, Token>,
     peeked: Option<Result<Token, ()>>,
     pub diagnostics: Vec<Diagnostic>,
+    recursion_depth: usize,
+    max_recursion_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +22,8 @@ impl<'source> Parser<'source> {
             lexer: Token::lexer(source),
             peeked: None,
             diagnostics: Vec::new(),
+            recursion_depth: 0,
+            max_recursion_depth: 256,
         }
     }
 
@@ -326,6 +330,23 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > self.max_recursion_depth {
+            self.recursion_depth -= 1;
+            return Err(Diagnostic {
+                message: format!(
+                    "maximum recursion depth {} exceeded",
+                    self.max_recursion_depth
+                ),
+                span: self.span(),
+            });
+        }
+        let result = self.parse_type_inner();
+        self.recursion_depth -= 1;
+        result
+    }
+
+    fn parse_type_inner(&mut self) -> Result<Type, Diagnostic> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::Ampersand) => {
@@ -504,6 +525,23 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > self.max_recursion_depth {
+            self.recursion_depth -= 1;
+            return Err(Diagnostic {
+                message: format!(
+                    "maximum recursion depth {} exceeded",
+                    self.max_recursion_depth
+                ),
+                span: self.span(),
+            });
+        }
+        let result = self.parse_block_inner();
+        self.recursion_depth -= 1;
+        result
+    }
+
+    fn parse_block_inner(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
         let mut stmts = Vec::new();
         loop {
             match self.peek() {
@@ -522,6 +560,23 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > self.max_recursion_depth {
+            self.recursion_depth -= 1;
+            return Err(Diagnostic {
+                message: format!(
+                    "maximum recursion depth {} exceeded",
+                    self.max_recursion_depth
+                ),
+                span: self.span(),
+            });
+        }
+        let result = self.parse_stmt_inner();
+        self.recursion_depth -= 1;
+        result
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, Diagnostic> {
         match self.peek() {
             Ok(Token::Set) | Ok(Token::Let) => self.parse_variable_def(),
             Ok(Token::If) => self.parse_if_stmt(),
@@ -1230,6 +1285,23 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > self.max_recursion_depth {
+            self.recursion_depth -= 1;
+            return Err(Diagnostic {
+                message: format!(
+                    "maximum recursion depth {} exceeded",
+                    self.max_recursion_depth
+                ),
+                span: self.span(),
+            });
+        }
+        let result = self.parse_pattern_inner();
+        self.recursion_depth -= 1;
+        result
+    }
+
+    fn parse_pattern_inner(&mut self) -> Result<Pattern, Diagnostic> {
         let start = self.span().start;
         match self.peek() {
             Ok(Token::Ident(s)) if s == "_" => {
@@ -1274,6 +1346,23 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, Diagnostic> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > self.max_recursion_depth {
+            self.recursion_depth -= 1;
+            return Err(Diagnostic {
+                message: format!(
+                    "maximum recursion depth {} exceeded",
+                    self.max_recursion_depth
+                ),
+                span: self.span(),
+            });
+        }
+        let result = self.parse_expr_bp_inner(min_bp);
+        self.recursion_depth -= 1;
+        result
+    }
+
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_prefix()?;
         loop {
             let token_opt = self.peek().as_ref().ok().cloned();
