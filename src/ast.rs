@@ -122,6 +122,7 @@ pub enum Expr {
         payload: Option<Box<Expr>>,
         span: Span,
     },
+    Move(Box<Expr>, Span),
     Tuple(Vec<Expr>, Span),
     Array(Vec<Expr>, Span),
     Closure {

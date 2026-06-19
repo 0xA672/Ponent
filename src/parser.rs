@@ -1437,14 +1437,7 @@ impl<'source> Parser<'source> {
             | Ok(Token::CharLiteral(_))
             | Ok(Token::True)
             | Ok(Token::False) => self.parse_literal(),
-            Ok(Token::Ident(_)) => {
-                let name = match self.advance() {
-                    Ok(Token::Ident(n)) => n,
-                    _ => unreachable!(),
-                };
-                let end = self.span().end;
-                Ok(Expr::Ident(name, Span::new(start, end)))
-            }
+            Ok(Token::Ident(_)) => self.parse_path_or_literal(start),
             Ok(Token::LParen) => {
                 self.advance().ok();
                 if matches!(self.peek(), Ok(Token::RParen)) {
@@ -1537,11 +1530,186 @@ impl<'source> Parser<'source> {
                     span: Span::new(start, end),
                 })
             }
+            Ok(Token::Move) => {
+                self.advance().ok();
+                let expr = self.parse_prefix()?;
+                let end = self.span().end;
+                Ok(Expr::Move(Box::new(expr), Span::new(start, end)))
+            }
+            Ok(Token::IntSuffix(s))
+            | Ok(Token::UIntSuffix(s))
+            | Ok(Token::HexIntSuffix(s))
+            | Ok(Token::HexUIntSuffix(s))
+            | Ok(Token::BinIntSuffix(s))
+            | Ok(Token::BinUIntSuffix(s)) => {
+                let s = s.clone();
+                self.advance().ok();
+                let end = self.span().end;
+                let value = if s.starts_with("0x") || s.starts_with("0X") {
+                    let num_part = &s[2..]
+                        .split(|c: char| c == 'i' || c == 'u')
+                        .next()
+                        .unwrap()
+                        .replace('_', "");
+                    i64::from_str_radix(&num_part, 16).unwrap_or(0)
+                } else if s.starts_with("0b") || s.starts_with("0B") {
+                    let num_part = &s[2..]
+                        .split(|c: char| c == 'i' || c == 'u')
+                        .next()
+                        .unwrap()
+                        .replace('_', "");
+                    i64::from_str_radix(&num_part, 2).unwrap_or(0)
+                } else {
+                    let num_part = s
+                        .split(|c: char| c == 'i' || c == 'u')
+                        .next()
+                        .unwrap()
+                        .replace('_', "");
+                    num_part.parse::<i64>().unwrap_or(0)
+                };
+                Ok(Expr::Literal(Literal::Int(value), Span::new(start, end)))
+            }
             _ => Err(Diagnostic {
                 message: "expected expression".to_string(),
                 span: self.span(),
             }),
         }
+    }
+
+    fn parse_path_or_literal(&mut self, start: usize) -> Result<Expr, Diagnostic> {
+        let mut path = Vec::new();
+        let name = match self.advance() {
+            Ok(Token::Ident(n)) => n,
+            _ => unreachable!(),
+        };
+        path.push(name);
+        while matches!(self.peek(), Ok(Token::ColonColon)) {
+            self.advance().ok();
+            if let Ok(Token::Ident(part)) = self.advance() {
+                path.push(part);
+            } else {
+                return Err(Diagnostic {
+                    message: "expected identifier after '::'".to_string(),
+                    span: self.span(),
+                });
+            }
+        }
+        match self.peek() {
+            Ok(Token::LBrace) => self.parse_struct_lit(path, start),
+            Ok(Token::LParen) => {
+                if path.len() >= 2 {
+                    let variant = path.pop().unwrap();
+                    self.parse_enum_lit(path, variant, start)
+                } else {
+                    self.parse_call(
+                        Expr::Ident(
+                            path.into_iter().next().unwrap(),
+                            Span::new(start, self.span().start),
+                        ),
+                        start,
+                    )
+                }
+            }
+            _ => {
+                if path.len() >= 2 {
+                    let variant = path.pop().unwrap();
+                    let end = self.span().end;
+                    Ok(Expr::EnumLit {
+                        path,
+                        variant,
+                        payload: None,
+                        span: Span::new(start, end),
+                    })
+                } else {
+                    Ok(Expr::Ident(
+                        path.into_iter().next().unwrap(),
+                        Span::new(start, self.span().end),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn parse_struct_lit(&mut self, path: Vec<String>, start: usize) -> Result<Expr, Diagnostic> {
+        self.expect(Token::LBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            if matches!(self.peek(), Ok(Token::RBrace)) {
+                self.advance().ok();
+                break;
+            }
+            let field_name = match self.advance() {
+                Ok(Token::Ident(n)) => n,
+                Ok(tok) => {
+                    return Err(Diagnostic {
+                        message: format!("expected field name, found {:?}", tok),
+                        span: self.span(),
+                    });
+                }
+                Err(()) => {
+                    return Err(Diagnostic {
+                        message: "unexpected end of file in struct literal".to_string(),
+                        span: self.span(),
+                    });
+                }
+            };
+            self.expect(Token::Assign)?;
+            let value = self.parse_expr()?;
+            fields.push((field_name, value));
+            if matches!(self.peek(), Ok(Token::Comma)) {
+                self.advance().ok();
+            } else {
+                self.expect(Token::RBrace)?;
+                break;
+            }
+        }
+        let end = self.span().end;
+        Ok(Expr::StructLit {
+            path,
+            fields,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_enum_lit(
+        &mut self,
+        path: Vec<String>,
+        variant: String,
+        start: usize,
+    ) -> Result<Expr, Diagnostic> {
+        self.expect(Token::LParen)?;
+        let payload = self.parse_expr()?;
+        self.expect(Token::RParen)?;
+        let end = self.span().end;
+        Ok(Expr::EnumLit {
+            path,
+            variant,
+            payload: Some(Box::new(payload)),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_call(&mut self, callee: Expr, start: usize) -> Result<Expr, Diagnostic> {
+        self.expect(Token::LParen)?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Ok(Token::RParen)) {
+            loop {
+                args.push(self.parse_expr()?);
+                if matches!(self.peek(), Ok(Token::Comma)) {
+                    self.advance().ok();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(Token::RParen)?;
+        let end = self.span().end;
+        Ok(Expr::Call {
+            callee: Box::new(callee),
+            args,
+            comptime: false,
+            span: Span::new(start, end),
+        })
     }
 
     fn parse_literal(&mut self) -> Result<Expr, Diagnostic> {
@@ -2084,5 +2252,29 @@ mod tests {
         let mut parser = Parser::new(src);
         let result = parser.parse_program();
         assert!(result.is_err() || !parser.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_struct_literal() {
+        let program = check_parse("def main() { set e = Employee { id = 1, name = b\"Alice\" }; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_enum_literal() {
+        let program = check_parse("def main() { set d = Department::Engineering; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_move_expression() {
+        let program = check_parse("def main() { set x = 1; set y = move x; }");
+        assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_suffixed_literal() {
+        let program = check_parse("def main() { set x = 42i32; }");
+        assert_eq!(program.items.len(), 1);
     }
 }
