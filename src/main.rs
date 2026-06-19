@@ -2,6 +2,7 @@ mod cli;
 mod lexer;
 
 use clap::Parser;
+use logos::Logos;
 use std::fs;
 
 fn main() {
