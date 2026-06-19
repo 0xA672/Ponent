@@ -132,6 +132,14 @@ pub enum Expr {
         body: Vec<Stmt>,
         span: Span,
     },
+    Try {
+        expr: Box<Expr>,
+        span: Span,
+    },
+    UnsafeBlock {
+        body: Vec<Stmt>,
+        span: Span,
+    },
     Catch {
         expr: Box<Expr>,
         branches: Vec<CatchBranch>,
@@ -222,6 +230,9 @@ pub enum Stmt {
         params: Vec<Param>,
         return_type: Type,
         body: Option<Vec<Stmt>>,
+        type_params: Vec<TypeParam>,
+        where_clause: Option<()>,
+        finally: Option<Vec<Stmt>>,
     },
     TypeDef {
         span: Span,
@@ -259,8 +270,21 @@ pub enum Stmt {
         else_branch: Option<Vec<Stmt>>,
         span: Span,
     },
+    IfLet {
+        pattern: Pattern,
+        scrutinee: Expr,
+        then_branch: Vec<Stmt>,
+        else_branch: Option<Vec<Stmt>>,
+        span: Span,
+    },
     While {
         cond: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    WhileLet {
+        pattern: Pattern,
+        scrutinee: Expr,
         body: Vec<Stmt>,
         span: Span,
     },
@@ -305,6 +329,25 @@ pub enum Stmt {
         name: String,
         span: Span,
     },
+    Unsafe {
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    GhostVariableDef {
+        inner: Box<Stmt>,
+        span: Span,
+    },
+    Isolate {
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    ImplBlock {
+        span: Span,
+        attributes: Vec<Attribute>,
+        trait_path: Option<Vec<String>>,
+        for_type: Type,
+        methods: Vec<ImplMethod>,
+    },
     Error(Span),
 }
 
@@ -317,7 +360,7 @@ pub enum VariableKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
-    pub ty: Type,
+    pub ty: Option<Type>,
     pub default: Option<Expr>,
     pub span: Span,
 }
