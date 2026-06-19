@@ -407,6 +407,8 @@ pub enum Token {
     AuditLog,
     #[token("interrupt")]
     Interrupt,
+    #[token("match")]
+    Match,
 
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),

@@ -1,5 +1,7 @@
+mod ast;
 mod cli;
 mod lexer;
+mod parser;
 
 use clap::Parser;
 use logos::Logos;
