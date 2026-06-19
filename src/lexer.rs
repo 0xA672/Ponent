@@ -17,8 +17,21 @@ fn parse_char_literal(s: &str) -> u8 {
                 u8::from_str_radix(&hex, 16).unwrap_or(0)
             }
             Some('u') => {
-                assert_eq!(chars.next(), Some('{'));
-                let scalar: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                if chars.next() != Some('{') {
+                    return 0;
+                }
+                let mut scalar = String::new();
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        closed = true;
+                        break;
+                    }
+                    scalar.push(c);
+                }
+                if !closed {
+                    return 0;
+                }
                 let code = u32::from_str_radix(&scalar, 16).unwrap_or(0);
                 if code <= 0x7F { code as u8 } else { 0 }
             }
@@ -35,7 +48,11 @@ fn parse_string_literal(s: &str) -> String {
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            match chars.next().unwrap() {
+            let next = match chars.next() {
+                Some(ch) => ch,
+                None => break,
+            };
+            match next {
                 'n' => result.push('\n'),
                 'r' => result.push('\r'),
                 't' => result.push('\t'),
@@ -49,8 +66,21 @@ fn parse_string_literal(s: &str) -> String {
                     result.push(byte as char);
                 }
                 'u' => {
-                    assert_eq!(chars.next().unwrap(), '{');
-                    let scalar: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                    if chars.next() != Some('{') {
+                        continue;
+                    }
+                    let mut scalar = String::new();
+                    let mut closed = false;
+                    for c in chars.by_ref() {
+                        if c == '}' {
+                            closed = true;
+                            break;
+                        }
+                        scalar.push(c);
+                    }
+                    if !closed {
+                        continue;
+                    }
                     let code = u32::from_str_radix(&scalar, 16).unwrap_or(0);
                     result.push(std::char::from_u32(code).unwrap_or('\u{FFFD}'));
                 }
@@ -69,7 +99,11 @@ fn parse_byte_string_literal(s: &str) -> Vec<u8> {
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            match chars.next().unwrap() {
+            let next = match chars.next() {
+                Some(ch) => ch,
+                None => break,
+            };
+            match next {
                 'n' => result.push(b'\n'),
                 'r' => result.push(b'\r'),
                 't' => result.push(b'\t'),
@@ -865,5 +899,23 @@ def main() -> Result<(), AppError> {
             Token::RBrace,
         ];
         check_tokens(source, expected);
+    }
+
+    #[test]
+    fn test_unicode_escape_handling() {
+        assert_eq!(parse_string_literal(r#""\u{41}""#), "A");
+        assert_eq!(parse_string_literal(r#""\u{0041}BC""#), "ABC");
+        assert_eq!(parse_string_literal(r#""\u{7F}""#), "\u{7F}");
+        assert_eq!(parse_string_literal(r#""\u{41""#), "");
+        assert_eq!(parse_string_literal(r#""\u{GG}""#), "\0");
+        assert_eq!(
+            parse_string_literal(r#""hello\u{26}world""#),
+            "hello\u{26}world"
+        );
+        assert_eq!(parse_char_literal(r"'\u{41}'"), b'A');
+        assert_eq!(parse_char_literal(r"'\u{7F}'"), 0x7F);
+        assert_eq!(parse_char_literal(r"'\u{41"), 0);
+        check_tokens(r#""\u{41}BC""#, vec![Token::StringLiteral("ABC".into())]);
+        check_tokens(r#""\u{41""#, vec![Token::StringLiteral("".into())]);
     }
 }
