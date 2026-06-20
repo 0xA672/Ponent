@@ -358,7 +358,7 @@ impl<'source> Parser<'source> {
 
     fn parse_attribute(&mut self) -> Result<Attribute, Diagnostic> {
         let start = self.span().start;
-        self.advance().ok(); // eat @
+        self.advance().ok();
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             Ok(tok) => self
@@ -381,9 +381,7 @@ impl<'source> Parser<'source> {
                     break;
                 }
                 let is_named = match self.peek() {
-                    Ok(Token::Ident(_)) => {
-                        matches!(self.peek_next(), Some(Token::Assign))
-                    }
+                    Ok(Token::Ident(_)) => matches!(self.peek_next(), Some(Token::Assign)),
                     _ => false,
                 };
                 if is_named {
@@ -523,7 +521,7 @@ impl<'source> Parser<'source> {
         doc: Option<String>,
     ) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
-        self.advance().ok(); // eat 'trait'
+        self.advance().ok();
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             _ => {
@@ -638,7 +636,7 @@ impl<'source> Parser<'source> {
 
     fn parse_constraint(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
-        self.advance().ok(); // eat 'constraint'
+        self.advance().ok();
         let name = match self.advance() {
             Ok(Token::Ident(name)) => name,
             _ => {
@@ -813,7 +811,10 @@ impl<'source> Parser<'source> {
                 } else {
                     None
                 };
+                let old_restrict = self.restrictions;
+                self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
                 let expr = self.parse_expr()?;
+                self.restrictions = old_restrict;
                 let end = self.span().end;
                 Ok(Contract::Ensures(expr, Span::new(start, end), on_ok))
             }
@@ -1097,23 +1098,23 @@ impl<'source> Parser<'source> {
             Ok(Token::Continue) => self.parse_continue_stmt(),
             Ok(Token::Return) => self.parse_return_stmt(),
             Ok(Token::LBrace) => {
-                let start = self.span().start;
+                let _start = self.span().start;
                 self.advance().ok();
                 let body = self.parse_block()?;
                 self.expect(Token::RBrace)?;
-                let end = self.span().end;
-                Ok(Stmt::Expression(Expr::Block(body, Span::new(start, end))))
+                let _end = self.span().end;
+                Ok(Stmt::Expression(Expr::Block(body, Span::new(_start, _end))))
             }
             Ok(Token::Comptime) => {
-                let start = self.span().start;
+                let _start = self.span().start;
                 self.advance().ok();
                 self.expect(Token::LBrace)?;
                 let body = self.parse_block()?;
                 self.expect(Token::RBrace)?;
-                let end = self.span().end;
+                let _end = self.span().end;
                 Ok(Stmt::ComptimeBlock {
                     body,
-                    span: Span::new(start, end),
+                    span: Span::new(_start, _end),
                 })
             }
             Ok(Token::ScopeCleanup) => self.parse_scope_cleanup(),
@@ -1122,14 +1123,14 @@ impl<'source> Parser<'source> {
             Ok(Token::Ghost) => self.parse_ghost_variable(),
             Ok(Token::Isolate) => self.parse_isolate_block(),
             Ok(Token::Match) => {
-                let start = self.span().start;
+                let _start = self.span().start;
                 let expr = self.parse_match_expr()?;
                 self.expect(Token::Semicolon)?;
-                let end = self.span().end;
+                let _end = self.span().end;
                 Ok(Stmt::Expression(expr))
             }
             _ => {
-                let start = self.span().start;
+                let _start = self.span().start;
                 let lhs = self.parse_expr()?;
                 if matches!(
                     self.peek(),
@@ -1149,29 +1150,21 @@ impl<'source> Parser<'source> {
                         _ => unreachable!(),
                     };
                     let value = self.parse_expr()?;
-                    self.expect(Token::Semicolon)
-                        .or_else(|_| Ok(Token::Semicolon))?;
-                    let end = self.span().end;
+                    self.expect(Token::Semicolon)?;
+                    let _end = self.span().end;
                     Ok(Stmt::Assign {
                         target: Box::new(lhs),
                         op,
                         value,
-                        span: Span::new(start, end),
+                        span: Span::new(_start, _end),
                     })
                 } else {
                     let at_end = matches!(self.peek(), Ok(Token::RBrace) | Err(()));
                     if at_end {
-                        if self.restrictions.contains(ParseRestrictions::VALUE_BLOCK) {
-                            Ok(Stmt::Expression(lhs))
-                        } else {
-                            self.expect(Token::Semicolon)
-                                .or_else(|_| Ok(Token::Semicolon))?;
-                            Ok(Stmt::Expression(lhs))
-                        }
+                        Ok(Stmt::Expression(lhs))
                     } else {
                         if self.restrictions.contains(ParseRestrictions::STMT_EXPR) {
-                            self.expect(Token::Semicolon)
-                                .or_else(|_| Ok(Token::Semicolon))?;
+                            self.expect(Token::Semicolon)?;
                         }
                         Ok(Stmt::Expression(lhs))
                     }
@@ -1297,8 +1290,7 @@ impl<'source> Parser<'source> {
         } else {
             None
         };
-        self.expect(Token::Semicolon)
-            .or_else(|_| Ok(Token::Semicolon))?;
+        self.expect(Token::Semicolon)?;
         let end = self.span().end;
         Ok(Stmt::VariableDef {
             kind,
@@ -1325,8 +1317,6 @@ impl<'source> Parser<'source> {
             self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
             self.restrictions = old_restrict;
-            let mut invariant: Option<Expr> = None;
-            let mut decreases: Option<Expr> = None;
             self.expect(Token::LBrace)?;
             let then_branch = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -1356,8 +1346,6 @@ impl<'source> Parser<'source> {
         self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
         self.restrictions = old_restrict;
-        let mut invariant: Option<Expr> = None;
-        let mut decreases: Option<Expr> = None;
         self.expect(Token::LBrace)?;
         let then_branch = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1394,8 +1382,6 @@ impl<'source> Parser<'source> {
             self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
             let scrutinee = self.parse_expr()?;
             self.restrictions = old_restrict;
-            let mut invariant: Option<Expr> = None;
-            let mut decreases: Option<Expr> = None;
             self.expect(Token::LBrace)?;
             let body = self.parse_block()?;
             self.expect(Token::RBrace)?;
@@ -1411,8 +1397,6 @@ impl<'source> Parser<'source> {
         self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
         let cond = self.parse_expr()?;
         self.restrictions = old_restrict;
-        let mut invariant: Option<Expr> = None;
-        let mut decreases: Option<Expr> = None;
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1439,12 +1423,18 @@ impl<'source> Parser<'source> {
             match self.peek() {
                 Ok(Token::Invariant) => {
                     self.advance().ok();
-                    let inv = self.parse_expr()?;
+                    let inv = self
+                        .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                            this.parse_expr()
+                        })?;
                     invariant = Some(inv);
                 }
                 Ok(Token::Decreases) => {
                     self.advance().ok();
-                    let dec = self.parse_expr()?;
+                    let dec = self
+                        .with_restrictions(ParseRestrictions::NO_STRUCT_LITERAL, |this| {
+                            this.parse_expr()
+                        })?;
                     decreases = Some(dec);
                 }
                 _ => break,
@@ -1480,19 +1470,29 @@ impl<'source> Parser<'source> {
     fn parse_leave_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        let label = if let Ok(Token::Ident(l)) = self.peek().clone() {
+        if matches!(self.peek(), Ok(Token::With)) {
             self.advance().ok();
-            Some(l.clone())
+            let expr = self.parse_expr()?;
+            self.expect(Token::Semicolon)?;
+            let end = self.span().end;
+            Ok(Stmt::Expression(Expr::LeaveWith {
+                expr: Box::new(expr),
+                span: Span::new(start, end),
+            }))
         } else {
-            None
-        };
-        self.expect(Token::Semicolon)
-            .or_else(|_| Ok(Token::Semicolon))?;
-        let end = self.span().end;
-        Ok(Stmt::Leave {
-            label,
-            span: Span::new(start, end),
-        })
+            let label = if let Ok(Token::Ident(l)) = self.peek().clone() {
+                self.advance().ok();
+                Some(l.clone())
+            } else {
+                None
+            };
+            self.expect(Token::Semicolon)?;
+            let end = self.span().end;
+            Ok(Stmt::Leave {
+                label,
+                span: Span::new(start, end),
+            })
+        }
     }
 
     fn parse_continue_stmt(&mut self) -> Result<Stmt, Diagnostic> {
@@ -1504,8 +1504,7 @@ impl<'source> Parser<'source> {
         } else {
             None
         };
-        self.expect(Token::Semicolon)
-            .or_else(|_| Ok(Token::Semicolon))?;
+        self.expect(Token::Semicolon)?;
         let end = self.span().end;
         Ok(Stmt::Continue {
             label,
@@ -1521,8 +1520,7 @@ impl<'source> Parser<'source> {
         } else {
             None
         };
-        self.expect(Token::Semicolon)
-            .or_else(|_| Ok(Token::Semicolon))?;
+        self.expect(Token::Semicolon)?;
         let end = self.span().end;
         Ok(Stmt::Return {
             value,
@@ -1567,8 +1565,7 @@ impl<'source> Parser<'source> {
                 });
             }
         };
-        self.expect(Token::Semicolon)
-            .or_else(|_| Ok(Token::Semicolon))?;
+        self.expect(Token::Semicolon)?;
         let end = self.span().end;
         Ok(Stmt::Trigger {
             name,
@@ -2403,6 +2400,7 @@ impl<'source> Parser<'source> {
             Some(Token::Not) => Some((16, false)),
             Some(Token::Tilde) => Some((16, false)),
             Some(Token::As) => Some((14, true)),
+            Some(Token::Catch) => Some((1, true)),
             _ => None,
         }
     }
@@ -2461,6 +2459,55 @@ impl<'source> Parser<'source> {
                 let end = self.span().end;
                 Ok(Expr::Array(exprs, Span::new(start, end)))
             }
+            Ok(Token::Plus) | Ok(Token::Minus) | Ok(Token::Star) | Ok(Token::Slash)
+            | Ok(Token::Percent) => {
+                let next = self.peek_next();
+                let is_operator_arg = matches!(
+                    next,
+                    Some(Token::Comma)
+                        | Some(Token::RParen)
+                        | Some(Token::RBracket)
+                        | Some(Token::RBrace)
+                );
+                if is_operator_arg {
+                    let op_tok = self.advance().unwrap();
+                    let op_name = match op_tok {
+                        Token::Plus => "+".to_string(),
+                        Token::Minus => "-".to_string(),
+                        Token::Star => "*".to_string(),
+                        Token::Slash => "/".to_string(),
+                        Token::Percent => "%".to_string(),
+                        _ => unreachable!(),
+                    };
+                    let end = self.span().end;
+                    Ok(Expr::Ident(op_name, Span::new(start, end)))
+                } else {
+                    match self.advance().unwrap() {
+                        Token::Minus => {
+                            let expr = self.parse_prefix()?;
+                            let end = self.span().end;
+                            Ok(Expr::UnaryOp {
+                                op: UnaryOp::Neg,
+                                expr: Box::new(expr),
+                                span: Span::new(start, end),
+                            })
+                        }
+                        Token::Star => {
+                            let expr = self.parse_prefix()?;
+                            let end = self.span().end;
+                            Ok(Expr::UnaryOp {
+                                op: UnaryOp::Deref,
+                                expr: Box::new(expr),
+                                span: Span::new(start, end),
+                            })
+                        }
+                        _ => Err(Diagnostic {
+                            message: "unexpected operator in expression".to_string(),
+                            span: self.span(),
+                        }),
+                    }
+                }
+            }
             Ok(Token::If) => self.parse_if_expr(),
             Ok(Token::Match) => self.parse_match_expr(),
             Ok(Token::Leave) => {
@@ -2492,16 +2539,6 @@ impl<'source> Parser<'source> {
                     span: Span::new(start, end),
                 })
             }
-            Ok(Token::Minus) => {
-                self.advance().ok();
-                let expr = self.parse_prefix()?;
-                let end = self.span().end;
-                Ok(Expr::UnaryOp {
-                    op: UnaryOp::Neg,
-                    expr: Box::new(expr),
-                    span: Span::new(start, end),
-                })
-            }
             Ok(Token::Tilde) => {
                 self.advance().ok();
                 let expr = self.parse_prefix()?;
@@ -2526,16 +2563,6 @@ impl<'source> Parser<'source> {
                     } else {
                         UnaryOp::Ref
                     },
-                    expr: Box::new(expr),
-                    span: Span::new(start, end),
-                })
-            }
-            Ok(Token::Star) => {
-                self.advance().ok();
-                let expr = self.parse_prefix()?;
-                let end = self.span().end;
-                Ok(Expr::UnaryOp {
-                    op: UnaryOp::Deref,
                     expr: Box::new(expr),
                     span: Span::new(start, end),
                 })
@@ -3126,6 +3153,7 @@ impl<'source> Parser<'source> {
                     } else {
                         None
                     };
+                    self.expect(Token::Pipe)?;
                     let body = if matches!(self.peek(), Ok(Token::FatArrow)) {
                         self.advance().ok();
                         let expr = self.parse_expr()?;
@@ -3729,5 +3757,12 @@ mod tests {
         let src = "def sum(arr: &[Int<32>]) -> Int<32> { set mut total = 0; for i in 0..arr'len invariant total == fold(arr[0..i], 0, +) decreases arr'len - i { total += arr[i]; } return total; }";
         let program = check_parse(src);
         assert_eq!(program.items.len(), 1);
+    }
+
+    #[test]
+    fn test_leave_with_in_catch() {
+        check_parse(
+            "def f() -> Result<(), ()> { let _ = x() catch { |E| { leave with Err(()); } }; Ok(()) }",
+        );
     }
 }
