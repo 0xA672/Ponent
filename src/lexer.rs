@@ -20,8 +20,7 @@ fn parse_char_literal(s: &str) -> Result<u8, String> {
                 if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Err("invalid hex digit in char literal".to_string());
                 }
-                let mut peekable = chars.clone();
-                if let Some(c) = peekable.next() {
+                if let Some(c) = chars.clone().next() {
                     if c.is_ascii_hexdigit() {
                         return Err("expected exactly 2 hex digits after \\x".to_string());
                     }
@@ -102,8 +101,7 @@ fn parse_string_literal(s: &str) -> Result<String, String> {
                     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                         return Err("invalid hex digit in string literal".to_string());
                     }
-                    let mut peekable = chars.clone();
-                    if let Some(c) = peekable.next() {
+                    if let Some(c) = chars.clone().next() {
                         if c.is_ascii_hexdigit() {
                             return Err("expected exactly 2 hex digits after \\x".to_string());
                         }
@@ -185,8 +183,7 @@ fn parse_byte_string_literal(s: &str) -> Result<Vec<u8>, String> {
                     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                         return Err("invalid hex digit in byte string literal".to_string());
                     }
-                    let mut peekable = chars.clone();
-                    if let Some(c) = peekable.next() {
+                    if let Some(c) = chars.clone().next() {
                         if c.is_ascii_hexdigit() {
                             return Err("expected exactly 2 hex digits after \\x".to_string());
                         }
@@ -782,7 +779,7 @@ mod tests {
             vec![Token::HexLiteral(Err("hex literal overflow".into()))],
         );
         check_tokens(
-            "0b111111111111111111111111111111111111111111111111111111111111111111",
+            "0b1111111111111111111111111111111111111111111111111111111111111111",
             vec![Token::BinLiteral(Err("binary literal overflow".into()))],
         );
         check_tokens("-42", vec![Token::Minus, Token::IntLiteral(Ok(42))]);
@@ -1506,5 +1503,38 @@ mod tests {
     fn strict_hex_escape_length() {
         assert!(parse_string_literal(r#""\x41A""#).is_err());
         assert!(parse_char_literal(r"'\x41A'").is_err());
+    }
+
+    #[test]
+    fn test_compact_code_no_spaces() {
+        check_tokens(
+            "def main(){set x=1+2;if(x<=3){return x;}}",
+            vec![
+                Token::Def,
+                Token::Ident("main".into()),
+                Token::LParen,
+                Token::RParen,
+                Token::LBrace,
+                Token::Set,
+                Token::Ident("x".into()),
+                Token::Assign,
+                Token::IntLiteral(Ok(1)),
+                Token::Plus,
+                Token::IntLiteral(Ok(2)),
+                Token::Semicolon,
+                Token::If,
+                Token::LParen,
+                Token::Ident("x".into()),
+                Token::Le,
+                Token::IntLiteral(Ok(3)),
+                Token::RParen,
+                Token::LBrace,
+                Token::Return,
+                Token::Ident("x".into()),
+                Token::Semicolon,
+                Token::RBrace,
+                Token::RBrace,
+            ],
+        );
     }
 }
