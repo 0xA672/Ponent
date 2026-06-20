@@ -3656,7 +3656,7 @@ mod tests {
 
     #[test]
     fn test_deprecated_attribute() {
-        let src = "@deprecated(\"use new_method\") def old() { }";
+        let src = "@deprecated(\"use new_method\") def old_fn() { }";
         let program = check_parse(src);
         match &program.items[0] {
             Stmt::FunctionDef { attributes, .. } => {
