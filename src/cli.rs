@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ponent", about = "Posita compiler")]
+#[command(name = "ponent", about = "Posita compiler toolchain")]
+#[command(subcommand_required = true)]
+#[command(arg_required_else_help = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -9,14 +11,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Tokenize a Posita source file and print tokens
     Lex {
-        /// Input file path
         file: String,
     },
-    /// Parse a Posita source file and print the AST (not yet implemented)
     Parse {
-        /// Input file path
         file: String,
+        #[arg(long)]
+        ast: bool,
     },
 }

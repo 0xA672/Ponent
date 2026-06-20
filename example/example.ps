@@ -1,0 +1,33 @@
+edition = "2026";
+
+type MyInt = Int<32>;
+
+def add(a: MyInt, b: MyInt) -> MyInt {
+    return a + b;
+}
+
+def fib(n: MyInt) -> MyInt
+    requires n >= 0
+{
+    if n == 0 {
+        return 0;
+    }
+    if n == 1 {
+        return 1;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+def main() {
+    set x = 10;
+    set y = 20;
+    set z = add(x, y);
+    set mut sum: MyInt = 0;
+    set mut i = 0;
+    while i < 10 {
+        sum = sum + i;
+        i = i + 1;
+    }
+    set f = fib(5);
+    return;
+}
