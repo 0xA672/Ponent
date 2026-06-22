@@ -63,6 +63,14 @@ pub enum UnaryOp {
     RefMut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rounding {
+    Round,
+    Trunc,
+    Ceil,
+    Floor,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal, Span),
@@ -103,6 +111,7 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: Box<Type>,
         safe: bool,
+        rounding: Option<Rounding>,
         span: Span,
     },
     Range {
@@ -344,6 +353,8 @@ pub enum Stmt {
     ScopeCleanup {
         name: String,
         body: Vec<Stmt>,
+        propagates: bool,
+        overrides: bool,
         span: Span,
     },
     Trigger {
@@ -396,7 +407,7 @@ pub struct TypeParam {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDefinition {
     Struct(Vec<StructField>),
-    Enum(Vec<EnumVariant>),
+    Enum(Vec<EnumVariant>, Option<String>), // missing_match message
     TraitDef {
         methods: Vec<TraitMethod>,
         associated_types: Vec<AssociatedType>,
@@ -488,6 +499,7 @@ pub enum Type {
     },
     Literal(Box<Expr>, Span),
     Never(Span),
+    Union(Vec<Type>, Span),
     Error(Span),
 }
 
@@ -521,9 +533,22 @@ pub struct Attribute {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum EnsuresTarget {
+    Unconditional,
+    OnOk(Option<Pattern>),
+    OnErr(Option<Pattern>),
+    OnTimeout,
+    OnCancel,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Contract {
     Requires(Expr, Span),
-    Ensures(Expr, Span, Option<Pattern>),
+    Ensures {
+        expr: Expr,
+        span: Span,
+        target: EnsuresTarget,
+    },
     Invariant(Expr, Span),
     Decreases(Expr, Span),
     Terminates(Expr, Span),

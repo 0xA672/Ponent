@@ -414,6 +414,10 @@ pub enum Token {
     Ceil,
     #[token("floor")]
     Floor,
+    #[token("propagates")]
+    Propagates,
+    #[token("overrides")]
+    Overrides,
 
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -684,7 +688,7 @@ mod tests {
     #[test]
     fn more_keywords() {
         check_tokens(
-            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info old audit_log interrupt",
+            "and or not sizeof alignof catch panic unsafe let finally where requires ensures invariant constraint move dyn by copy ref mut wrap saturate trap Self no_default extern pub edition deprecated experimental endian bit_order align pad packed async await task channel linear consume pure io trusted ghost scope_cleanup trigger validate missing_match apply_lemma exists forall on trait impl decreases terminates cfg isolate hint must_use must_handle link_proof exhaustive no_alloc_error no_panic debug_info old audit_log interrupt round trunc ceil floor propagates overrides",
             vec![
                 Token::And,
                 Token::Or,
@@ -757,6 +761,12 @@ mod tests {
                 Token::Old,
                 Token::AuditLog,
                 Token::Interrupt,
+                Token::Round,
+                Token::Trunc,
+                Token::Ceil,
+                Token::Floor,
+                Token::Propagates,
+                Token::Overrides,
             ],
         );
     }

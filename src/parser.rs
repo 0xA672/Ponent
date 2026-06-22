@@ -240,6 +240,8 @@ impl<'source> Parser<'source> {
             Token::Trunc => Some("trunc".into()),
             Token::Ceil => Some("ceil".into()),
             Token::Floor => Some("floor".into()),
+            Token::Propagates => Some("propagates".into()),
+            Token::Overrides => Some("overrides".into()),
             _ => None,
         }
     }
@@ -783,13 +785,18 @@ impl<'source> Parser<'source> {
                 Ok(Contract::Requires(expr, Span::new(start, end)))
             }
             Token::Ensures => {
-                let on_ok = if matches!(self.peek(), Ok(Token::On)) {
+                let mut target = EnsuresTarget::Unconditional;
+                if matches!(self.peek(), Ok(Token::On)) {
                     self.advance().ok();
                     match self.peek() {
                         Ok(Token::Ident(s)) if s == "Ok" => {
                             self.advance().ok();
                             self.expect(Token::LParen)?;
-                            let pat = self.parse_pattern()?;
+                            let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
+                                Some(self.parse_pattern()?)
+                            } else {
+                                None
+                            };
                             self.expect(Token::RParen)?;
                             if matches!(self.peek(), Ok(Token::FatArrow)) {
                                 self.advance().ok();
@@ -799,24 +806,45 @@ impl<'source> Parser<'source> {
                                     span: self.span(),
                                 });
                             }
-                            Some(pat)
+                            target = EnsuresTarget::OnOk(pat);
+                        }
+                        Ok(Token::Ident(s)) if s == "Err" => {
+                            self.advance().ok();
+                            self.expect(Token::LParen)?;
+                            let pat = if !matches!(self.peek(), Ok(Token::RParen)) {
+                                Some(self.parse_pattern()?)
+                            } else {
+                                None
+                            };
+                            self.expect(Token::RParen)?;
+                            if matches!(self.peek(), Ok(Token::FatArrow)) {
+                                self.advance().ok();
+                            } else {
+                                return Err(Diagnostic {
+                                    message: "expected '=>' after on Err(...)".into(),
+                                    span: self.span(),
+                                });
+                            }
+                            target = EnsuresTarget::OnErr(pat);
                         }
                         _ => {
                             return Err(Diagnostic {
-                                message: "expected 'Ok' after 'on'".into(),
+                                message: "expected 'Ok' or 'Err' after 'on'".into(),
                                 span: self.span(),
                             });
                         }
                     }
-                } else {
-                    None
-                };
+                }
                 let old_restrict = self.restrictions;
                 self.restrictions |= ParseRestrictions::NO_STRUCT_LITERAL;
                 let expr = self.parse_expr()?;
                 self.restrictions = old_restrict;
                 let end = self.span().end;
-                Ok(Contract::Ensures(expr, Span::new(start, end), on_ok))
+                Ok(Contract::Ensures {
+                    expr,
+                    span: Span::new(start, end),
+                    target,
+                })
             }
             Token::Invariant => {
                 let expr = self.parse_expr()?;
@@ -937,6 +965,11 @@ impl<'source> Parser<'source> {
                 let expr = self.parse_literal()?;
                 let end = self.span().end;
                 Ok(Type::Literal(Box::new(expr), Span::new(start, end)))
+            }
+            Ok(Token::Type) => {
+                self.advance().ok();
+                let end = self.span().end;
+                Ok(Type::Path(vec!["type".to_string()], Span::new(start, end)))
             }
             _ => match self.advance() {
                 Ok(Token::Ident(name)) => {
@@ -1591,6 +1624,21 @@ impl<'source> Parser<'source> {
                 });
             }
         };
+        let mut propagates = false;
+        let mut overrides = false;
+        if matches!(self.peek(), Ok(Token::Propagates)) {
+            self.advance().ok();
+            propagates = true;
+            if matches!(self.peek(), Ok(Token::Overrides)) {
+                self.advance().ok();
+                overrides = true;
+            }
+        } else if matches!(self.peek(), Ok(Token::Overrides)) {
+            return Err(Diagnostic {
+                message: "`overrides` must be used together with `propagates`".to_string(),
+                span: self.span(),
+            });
+        }
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -1598,6 +1646,8 @@ impl<'source> Parser<'source> {
         Ok(Stmt::ScopeCleanup {
             name,
             body,
+            propagates,
+            overrides,
             span: Span::new(start, end),
         })
     }
@@ -1947,10 +1997,38 @@ impl<'source> Parser<'source> {
                             break;
                         }
                     }
-                    TypeDefinition::Enum(variants)
+                    let missing_match = if matches!(self.peek(), Ok(Token::With)) {
+                        self.advance().ok();
+                        self.expect(Token::MissingMatch)?;
+                        self.expect(Token::Assign)?;
+                        let msg = match self.advance() {
+                            Ok(Token::StringLiteral(Ok(s))) => s,
+                            _ => {
+                                return Err(Diagnostic {
+                                    message: "expected string for missing_match".to_string(),
+                                    span: self.span(),
+                                });
+                            }
+                        };
+                        self.expect(Token::Semicolon)?;
+                        Some(msg)
+                    } else {
+                        None
+                    };
+                    TypeDefinition::Enum(variants, missing_match)
                 }
                 _ => {
                     let ty = self.parse_type()?;
+                    let ty = if matches!(self.peek(), Ok(Token::Pipe)) {
+                        let mut types = vec![ty];
+                        while matches!(self.peek(), Ok(Token::Pipe)) {
+                            self.advance().ok();
+                            types.push(self.parse_type()?);
+                        }
+                        Type::Union(types, Span::new(start, self.span().end))
+                    } else {
+                        ty
+                    };
                     let modifiers = self.parse_type_modifiers()?;
                     if matches!(self.peek(), Ok(Token::Semicolon)) {
                         self.advance().ok();
@@ -1960,6 +2038,16 @@ impl<'source> Parser<'source> {
             }
         } else {
             let ty = self.parse_type()?;
+            let ty = if matches!(self.peek(), Ok(Token::Pipe)) {
+                let mut types = vec![ty];
+                while matches!(self.peek(), Ok(Token::Pipe)) {
+                    self.advance().ok();
+                    types.push(self.parse_type()?);
+                }
+                Type::Union(types, Span::new(start, self.span().end))
+            } else {
+                ty
+            };
             let modifiers = self.parse_type_modifiers()?;
             if matches!(self.peek(), Ok(Token::Semicolon)) {
                 self.advance().ok();
@@ -2974,14 +3062,34 @@ impl<'source> Parser<'source> {
                 self.advance().ok();
                 let safe = !matches!(self.peek(), Ok(Token::Bang));
                 if !safe {
-                    self.advance().ok(); // eat '!'
+                    self.advance().ok();
                 }
                 let ty = self.parse_type()?;
+                let rounding = match self.peek() {
+                    Ok(Token::Round) => {
+                        self.advance().ok();
+                        Some(Rounding::Round)
+                    }
+                    Ok(Token::Trunc) => {
+                        self.advance().ok();
+                        Some(Rounding::Trunc)
+                    }
+                    Ok(Token::Ceil) => {
+                        self.advance().ok();
+                        Some(Rounding::Ceil)
+                    }
+                    Ok(Token::Floor) => {
+                        self.advance().ok();
+                        Some(Rounding::Floor)
+                    }
+                    _ => None,
+                };
                 let end = self.span().end;
                 Ok(Expr::Cast {
                     expr: Box::new(lhs),
                     ty: Box::new(ty),
                     safe,
+                    rounding,
                     span: Span::new(start, end),
                 })
             }
@@ -3442,20 +3550,18 @@ mod tests {
         let program = check_parse("def main() { scope_cleanup @close_file { } }");
         match &program.items[0] {
             Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
-                Stmt::ScopeCleanup { name, body: _, .. } => assert_eq!(name, "close_file"),
+                Stmt::ScopeCleanup {
+                    name,
+                    body: _,
+                    propagates,
+                    overrides,
+                    ..
+                } => {
+                    assert_eq!(name, "close_file");
+                    assert!(!propagates);
+                    assert!(!overrides);
+                }
                 _ => panic!("expected ScopeCleanup"),
-            },
-            _ => panic!("expected FunctionDef"),
-        }
-    }
-
-    #[test]
-    fn test_trigger_with_at() {
-        let program = check_parse("def main() { trigger @close_file; }");
-        match &program.items[0] {
-            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
-                Stmt::Trigger { name, .. } => assert_eq!(name, "close_file"),
-                _ => panic!("expected Trigger"),
             },
             _ => panic!("expected FunctionDef"),
         }
@@ -3726,8 +3832,8 @@ mod tests {
             Stmt::FunctionDef { contracts, .. } => {
                 assert_eq!(contracts.len(), 2);
                 match &contracts[1] {
-                    Contract::Ensures(_, _, on_ok) => {
-                        assert!(on_ok.is_some());
+                    Contract::Ensures { target, .. } => {
+                        assert!(matches!(target, EnsuresTarget::OnOk(Some(_))));
                     }
                     _ => panic!("expected Ensures contract"),
                 }
@@ -3842,6 +3948,143 @@ mod tests {
                     assert!(!safe);
                 }
                 _ => panic!("expected Cast"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_scope_cleanup_with_propagates() {
+        let program = check_parse("def main() { scope_cleanup @close_file propagates { } }");
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::ScopeCleanup {
+                    propagates,
+                    overrides,
+                    ..
+                } => {
+                    assert!(propagates);
+                    assert!(!overrides);
+                }
+                _ => panic!("expected ScopeCleanup"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_scope_cleanup_with_propagates_overrides() {
+        let program =
+            check_parse("def main() { scope_cleanup @close_file propagates overrides { } }");
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::ScopeCleanup {
+                    propagates,
+                    overrides,
+                    ..
+                } => {
+                    assert!(propagates);
+                    assert!(overrides);
+                }
+                _ => panic!("expected ScopeCleanup"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_scope_cleanup_overrides_without_propagates_fails() {
+        let src = "def main() { scope_cleanup @close_file overrides { } }";
+        let mut parser = Parser::new(src);
+        let result = parser.parse_program();
+        assert!(result.is_err() || !parser.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_ensures_on_err() {
+        let src = "def f() -> Result<Int<32>, Err> ensures on Err(e) => e != 0 { return Err(1); }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { contracts, .. } => {
+                assert_eq!(contracts.len(), 1);
+                match &contracts[0] {
+                    Contract::Ensures { target, .. } => {
+                        assert!(matches!(target, EnsuresTarget::OnErr(Some(_))));
+                    }
+                    _ => panic!("expected Ensures"),
+                }
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_type_union_alias() {
+        let src = "type AppError = IoError | ParseError;";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Alias(ty, _),
+                ..
+            } => {
+                assert!(matches!(ty, Type::Union(..)));
+            }
+            _ => panic!("expected Union type alias"),
+        }
+    }
+
+    #[test]
+    fn test_type_keyword_as_literal() {
+        let src = "comptime def foo() -> type { return 42; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { return_type, .. } => {
+                assert!(matches!(return_type, Type::Path(path, _) if path == &["type"]));
+            }
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_cast_with_rounding() {
+        let src = "def f() { set x = 3.14 as Int<32> round; }";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::VariableDef {
+                    value: Some(Expr::Cast { rounding, .. }),
+                    ..
+                } => {
+                    assert_eq!(rounding, &Some(Rounding::Round));
+                }
+                _ => panic!("expected Cast with rounding"),
+            },
+            _ => panic!("expected FunctionDef"),
+        }
+    }
+
+    #[test]
+    fn test_enum_missing_match() {
+        let src = "type State = enum { A, B } with missing_match = \"missing variants\";";
+        let program = check_parse(src);
+        match &program.items[0] {
+            Stmt::TypeDef {
+                definition: TypeDefinition::Enum(_, Some(msg)),
+                ..
+            } => {
+                assert_eq!(msg, "missing variants");
+            }
+            _ => panic!("expected Enum with missing_match"),
+        }
+    }
+
+    #[test]
+    fn test_trigger_with_at() {
+        let program = check_parse("def main() { trigger @close_file; }");
+        match &program.items[0] {
+            Stmt::FunctionDef { body, .. } => match &body.as_ref().unwrap()[0] {
+                Stmt::Trigger { name, .. } => assert_eq!(name, "close_file"),
+                _ => panic!("expected Trigger"),
             },
             _ => panic!("expected FunctionDef"),
         }
