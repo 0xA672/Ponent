@@ -1,21 +1,15 @@
-use crate::ast::AssociatedType;
-use crate::ast::Attribute;
-use crate::ast::Contract;
-use crate::ast::Span;
-use crate::ast::TraitMethod;
-use crate::ast::TypeParam;
-use crate::hir::types::{DefId, TypeError, TypeId};
+use crate::ast::*;
+use crate::hir::types::*;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BindingKind {
-    Variable,
-    Function,
-    Type,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeKind {
+    Struct,
+    Enum,
+    Alias,
     Trait,
     Impl,
-    Module,
+    Constraint,
 }
 
 #[derive(Debug, Clone)]
@@ -24,37 +18,33 @@ pub struct VariableBinding {
     pub mutable: bool,
     pub span: Span,
     pub def_id: DefId,
-    pub is_ghost: bool,
-    pub is_comptime: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Parameter {
+    pub name: String,
+    pub ty: TypeId,
+    pub span: Span,
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
-    pub params: Vec<(String, TypeId)>,
-    pub ret: TypeId,
+    pub params: Vec<Parameter>,
+    pub return_type: TypeId,
     pub type_params: Vec<TypeParam>,
-    pub variadic: bool,
+    pub where_clause: Option<WhereClause>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FunctionBinding {
-    pub signature: FunctionSignature,
     pub def_id: DefId,
+    pub signature: FunctionSignature,
     pub is_comptime: bool,
     pub is_async: bool,
     pub is_pure: bool,
-    pub is_trusted: bool,
     pub contracts: Vec<Contract>,
     pub attributes: Vec<Attribute>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TypeKind {
-    Struct,
-    Enum,
-    Alias,
-    Opaque,
 }
 
 #[derive(Debug, Clone)]
@@ -63,43 +53,32 @@ pub struct TypeBinding {
     pub params: Vec<TypeParam>,
     pub kind: TypeKind,
     pub span: Span,
+    pub alias_body: Option<TypeId>,
+    pub fields: Vec<StructField>,
+    pub variants: Vec<EnumVariant>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TraitBinding {
     pub def_id: DefId,
-    pub params: Vec<TypeParam>,
-    pub methods: Vec<TraitMethod>,
-    pub associated_types: Vec<AssociatedType>,
+    pub methods: Vec<(String, FunctionSignature)>,
+    pub associated_types: Vec<(String, Option<Type>)>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImplBinding {
     pub def_id: DefId,
-    pub trait_path: Option<Vec<String>>,
-    pub for_type: TypeId,
+    pub methods: Vec<ImplMethod>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone)]
-pub struct ModuleBinding {
-    pub name: String,
-    pub def_id: DefId,
+pub struct ConstraintBinding {
+    pub bounds: Vec<TypeId>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
-pub enum Binding {
-    Variable(VariableBinding),
-    Function(FunctionBinding),
-    Type(TypeBinding),
-    Trait(TraitBinding),
-    Impl(ImplBinding),
-    Module(ModuleBinding),
-}
-
-#[derive(Debug, Clone)]
 pub struct Scope {
     pub parent: Option<usize>,
     pub variables: HashMap<String, VariableBinding>,
@@ -107,7 +86,7 @@ pub struct Scope {
     pub types: HashMap<String, TypeBinding>,
     pub traits: HashMap<String, TraitBinding>,
     pub impls: Vec<ImplBinding>,
-    pub modules: HashMap<String, ModuleBinding>,
+    pub constraints: HashMap<String, ConstraintBinding>,
 }
 
 impl Scope {
@@ -119,16 +98,16 @@ impl Scope {
             types: HashMap::new(),
             traits: HashMap::new(),
             impls: Vec::new(),
-            modules: HashMap::new(),
+            constraints: HashMap::new(),
         }
     }
 }
 
 pub struct SymbolTable {
-    pub scopes: Vec<Scope>,
-    pub current_scope: usize,
-    pub def_counter: usize,
-    pub type_id_counter: usize,
+    scopes: Vec<Scope>,
+    current_scope: usize,
+    type_defs: HashMap<DefId, TypeBinding>,
+    next_def_id: usize,
 }
 
 impl SymbolTable {
@@ -137,18 +116,17 @@ impl SymbolTable {
         SymbolTable {
             scopes: vec![root],
             current_scope: 0,
-            def_counter: 0,
-            type_id_counter: 0,
+            type_defs: HashMap::new(),
+            next_def_id: 0,
         }
     }
 
     pub fn push_scope(&mut self) -> usize {
-        let parent = self.current_scope;
-        let scope = Scope::new(Some(parent));
-        let id = self.scopes.len();
+        let parent = Some(self.current_scope);
+        let scope = Scope::new(parent);
         self.scopes.push(scope);
-        self.current_scope = id;
-        id
+        self.current_scope = self.scopes.len() - 1;
+        self.current_scope
     }
 
     pub fn pop_scope(&mut self) {
@@ -157,18 +135,105 @@ impl SymbolTable {
         }
     }
 
-    pub fn current(&mut self) -> &mut Scope {
-        &mut self.scopes[self.current_scope]
+    pub fn current_scope(&self) -> usize {
+        self.current_scope
     }
 
-    pub fn lookup_variable(&self, name: &str) -> Option<&VariableBinding> {
-        let mut scope = self.current_scope;
-        while let Some(sc) = self.scopes.get(scope) {
-            if let Some(binding) = sc.variables.get(name) {
+    pub fn insert_variable(
+        &mut self,
+        name: String,
+        binding: VariableBinding,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let scope = &mut self.scopes[self.current_scope];
+        if scope.variables.contains_key(&name) {
+            return Err(
+                Diagnostic::error(format!("variable '{}' already defined", name)).with_span(span),
+            );
+        }
+        scope.variables.insert(name, binding);
+        Ok(())
+    }
+
+    pub fn insert_function(
+        &mut self,
+        name: String,
+        binding: FunctionBinding,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let scope = &mut self.scopes[self.current_scope];
+        if scope.functions.contains_key(&name) {
+            return Err(
+                Diagnostic::error(format!("function '{}' already defined", name)).with_span(span),
+            );
+        }
+        scope.functions.insert(name, binding);
+        Ok(())
+    }
+
+    pub fn insert_type(
+        &mut self,
+        name: String,
+        binding: TypeBinding,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let scope = &mut self.scopes[self.current_scope];
+        if scope.types.contains_key(&name) {
+            return Err(
+                Diagnostic::error(format!("type '{}' already defined", name)).with_span(span),
+            );
+        }
+        let def_id = binding.def_id;
+        self.type_defs.insert(def_id, binding.clone());
+        scope.types.insert(name, binding);
+        Ok(())
+    }
+
+    pub fn insert_trait(
+        &mut self,
+        name: String,
+        binding: TraitBinding,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let scope = &mut self.scopes[self.current_scope];
+        if scope.traits.contains_key(&name) {
+            return Err(
+                Diagnostic::error(format!("trait '{}' already defined", name)).with_span(span),
+            );
+        }
+        scope.traits.insert(name, binding);
+        Ok(())
+    }
+
+    pub fn insert_impl(&mut self, binding: ImplBinding, span: Span) {
+        let scope = &mut self.scopes[self.current_scope];
+        scope.impls.push(binding);
+    }
+
+    pub fn insert_constraint(
+        &mut self,
+        name: String,
+        binding: ConstraintBinding,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let scope = &mut self.scopes[self.current_scope];
+        if scope.constraints.contains_key(&name) {
+            return Err(
+                Diagnostic::error(format!("constraint '{}' already defined", name)).with_span(span),
+            );
+        }
+        scope.constraints.insert(name, binding);
+        Ok(())
+    }
+
+    pub fn lookup_variable(&self, name: &str, span: Span) -> Option<&VariableBinding> {
+        let mut idx = self.current_scope;
+        while let Some(scope) = self.scopes.get(idx) {
+            if let Some(binding) = scope.variables.get(name) {
                 return Some(binding);
             }
-            if let Some(parent) = sc.parent {
-                scope = parent;
+            if let Some(parent) = scope.parent {
+                idx = parent;
             } else {
                 break;
             }
@@ -177,13 +242,13 @@ impl SymbolTable {
     }
 
     pub fn lookup_function(&self, name: &str) -> Option<&FunctionBinding> {
-        let mut scope = self.current_scope;
-        while let Some(sc) = self.scopes.get(scope) {
-            if let Some(binding) = sc.functions.get(name) {
+        let mut idx = self.current_scope;
+        while let Some(scope) = self.scopes.get(idx) {
+            if let Some(binding) = scope.functions.get(name) {
                 return Some(binding);
             }
-            if let Some(parent) = sc.parent {
-                scope = parent;
+            if let Some(parent) = scope.parent {
+                idx = parent;
             } else {
                 break;
             }
@@ -192,28 +257,32 @@ impl SymbolTable {
     }
 
     pub fn lookup_type(&self, name: &str) -> Option<&TypeBinding> {
-        let mut scope = self.current_scope;
-        while let Some(sc) = self.scopes.get(scope) {
-            if let Some(binding) = sc.types.get(name) {
+        let mut idx = self.current_scope;
+        while let Some(scope) = self.scopes.get(idx) {
+            if let Some(binding) = scope.types.get(name) {
                 return Some(binding);
             }
-            if let Some(parent) = sc.parent {
-                scope = parent;
+            if let Some(parent) = scope.parent {
+                idx = parent;
             } else {
                 break;
             }
         }
         None
+    }
+
+    pub fn lookup_type_by_def_id(&self, def_id: DefId) -> Option<&TypeBinding> {
+        self.type_defs.get(&def_id)
     }
 
     pub fn lookup_trait(&self, name: &str) -> Option<&TraitBinding> {
-        let mut scope = self.current_scope;
-        while let Some(sc) = self.scopes.get(scope) {
-            if let Some(binding) = sc.traits.get(name) {
+        let mut idx = self.current_scope;
+        while let Some(scope) = self.scopes.get(idx) {
+            if let Some(binding) = scope.traits.get(name) {
                 return Some(binding);
             }
-            if let Some(parent) = sc.parent {
-                scope = parent;
+            if let Some(parent) = scope.parent {
+                idx = parent;
             } else {
                 break;
             }
@@ -221,14 +290,14 @@ impl SymbolTable {
         None
     }
 
-    pub fn lookup_module(&self, name: &str) -> Option<&ModuleBinding> {
-        let mut scope = self.current_scope;
-        while let Some(sc) = self.scopes.get(scope) {
-            if let Some(binding) = sc.modules.get(name) {
+    pub fn lookup_constraint(&self, name: &str) -> Option<&ConstraintBinding> {
+        let mut idx = self.current_scope;
+        while let Some(scope) = self.scopes.get(idx) {
+            if let Some(binding) = scope.constraints.get(name) {
                 return Some(binding);
             }
-            if let Some(parent) = sc.parent {
-                scope = parent;
+            if let Some(parent) = scope.parent {
+                idx = parent;
             } else {
                 break;
             }
@@ -236,147 +305,38 @@ impl SymbolTable {
         None
     }
 
-    pub fn insert_variable(
-        &mut self,
-        name: &str,
-        binding: VariableBinding,
-    ) -> Result<(), TypeError> {
-        match self.current().variables.entry(name.to_string()) {
-            Entry::Occupied(entry) => Err(TypeError::DuplicateDefinition {
-                name: name.to_string(),
-                span: binding.span,
-                previous: entry.get().span,
-            }),
-            Entry::Vacant(entry) => {
-                entry.insert(binding);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn insert_function(
-        &mut self,
-        name: &str,
-        binding: FunctionBinding,
-    ) -> Result<(), TypeError> {
-        match self.current().functions.entry(name.to_string()) {
-            Entry::Occupied(entry) => Err(TypeError::DuplicateDefinition {
-                name: name.to_string(),
-                span: binding.span,
-                previous: entry.get().span,
-            }),
-            Entry::Vacant(entry) => {
-                entry.insert(binding);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn insert_type(&mut self, name: &str, binding: TypeBinding) -> Result<(), TypeError> {
-        match self.current().types.entry(name.to_string()) {
-            Entry::Occupied(entry) => Err(TypeError::DuplicateDefinition {
-                name: name.to_string(),
-                span: binding.span,
-                previous: entry.get().span,
-            }),
-            Entry::Vacant(entry) => {
-                entry.insert(binding);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn insert_trait(&mut self, name: &str, binding: TraitBinding) -> Result<(), TypeError> {
-        match self.current().traits.entry(name.to_string()) {
-            Entry::Occupied(entry) => Err(TypeError::DuplicateDefinition {
-                name: name.to_string(),
-                span: binding.span,
-                previous: entry.get().span,
-            }),
-            Entry::Vacant(entry) => {
-                entry.insert(binding);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn insert_impl(&mut self, binding: ImplBinding) {
-        self.current().impls.push(binding);
-    }
-
-    pub fn insert_module(&mut self, name: &str, binding: ModuleBinding) -> Result<(), TypeError> {
-        match self.current().modules.entry(name.to_string()) {
-            Entry::Occupied(entry) => Err(TypeError::DuplicateDefinition {
-                name: name.to_string(),
-                span: binding.span,
-                previous: entry.get().span,
-            }),
-            Entry::Vacant(entry) => {
-                entry.insert(binding);
-                Ok(())
-            }
-        }
-    }
-
-    pub fn resolve_path(&self, path: &[String]) -> Option<DefId> {
+    pub fn lookup_type_by_path(&self, path: &[String]) -> Option<DefId> {
         if path.is_empty() {
             return None;
         }
-        let mut scope = self.current_scope;
-        let mut current = Vec::new();
-        let mut found = None;
-        for (i, seg) in path.iter().enumerate() {
-            if i == 0 {
-                if let Some(module) = self.lookup_module(seg) {
-                    found = Some(module.def_id);
-                    continue;
-                }
-                if let Some(ty) = self.lookup_type(seg) {
-                    if path.len() == 1 {
-                        return Some(ty.def_id);
-                    } else {
-                        return None;
-                    }
-                }
-                if let Some(trait_) = self.lookup_trait(seg) {
-                    if path.len() == 1 {
-                        return Some(trait_.def_id);
-                    } else {
-                        return None;
-                    }
-                }
-                return None;
-            } else {
-                if let Some(def_id) = found {
-                    return Some(def_id);
-                }
-                return None;
-            }
+        let name = &path[0];
+        let binding = self.lookup_type(name)?;
+        if path.len() == 1 {
+            return Some(binding.def_id);
         }
-        found
+        None
     }
 
-    pub fn next_def_id(&mut self) -> DefId {
-        let id = self.def_counter;
-        self.def_counter += 1;
-        DefId(id)
+    pub fn lookup_trait_by_path(&self, path: &[String]) -> Option<DefId> {
+        if path.len() != 1 {
+            return None;
+        }
+        let binding = self.lookup_trait(&path[0])?;
+        Some(binding.def_id)
     }
 
-    pub fn current_scope_id(&self) -> usize {
-        self.current_scope
+    pub fn lookup_field(&self, def_id: DefId, name: &str) -> Option<TypeId> {
+        let binding = self.type_defs.get(&def_id)?;
+        if let TypeKind::Struct = binding.kind {
+            binding.fields.iter().find(|f| f.name == name).map(|f| f.ty)
+        } else {
+            None
+        }
     }
 
-    pub fn get_scope(&self, id: usize) -> Option<&Scope> {
-        self.scopes.get(id)
-    }
-
-    pub fn get_scope_mut(&mut self, id: usize) -> Option<&mut Scope> {
-        self.scopes.get_mut(id)
-    }
-}
-
-impl Default for SymbolTable {
-    fn default() -> Self {
-        Self::new()
+    pub fn allocate_def_id(&mut self) -> DefId {
+        let id = DefId(self.next_def_id);
+        self.next_def_id += 1;
+        id
     }
 }

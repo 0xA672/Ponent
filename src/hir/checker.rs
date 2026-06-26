@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::hir::*;
+use crate::hir::provider::*;
 use crate::hir::symbol::*;
 use crate::hir::types::*;
 
@@ -51,6 +52,8 @@ pub enum ConstraintKind {
 
 impl<'a> TypeChecker<'a> {
     pub fn new(ctx: &'a mut TypeContext, symbols: &'a SymbolTable) -> Self {
+        let provider = SymbolProviderImpl::new(symbols);
+        ctx.set_symbol_provider(provider);
         TypeChecker {
             ctx,
             symbols,
@@ -588,16 +591,34 @@ impl<'a> TypeChecker<'a> {
                 Ok(HirPattern::Tuple(hir_patterns, *span))
             }
             Pattern::Struct { path, fields, span } => {
-                let mut hir_fields = Vec::new();
-                for (name, pat) in fields {
-                    let field_ty = self.ctx.error();
-                    hir_fields.push((name.clone(), Box::new(self.check_pattern(pat, field_ty)?)));
+                let def_id = self.resolve_def_id(path)?;
+                let binding = self
+                    .symbols
+                    .lookup_type_by_def_id(def_id)
+                    .ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
+                if let TypeKind::Struct = binding.kind {
+                    let mut hir_fields = Vec::new();
+                    for (name, pat) in fields {
+                        let field_ty = binding
+                            .fields
+                            .iter()
+                            .find(|f| f.name == *name)
+                            .map(|f| f.ty)
+                            .ok_or_else(|| {
+                                Diagnostic::error(format!("field '{}' not found", name))
+                                    .with_span(*span)
+                            })?;
+                        let hir_pat = self.check_pattern(pat, field_ty)?;
+                        hir_fields.push((name.clone(), Box::new(hir_pat)));
+                    }
+                    Ok(HirPattern::Struct {
+                        path: path.clone(),
+                        fields: hir_fields,
+                        span: *span,
+                    })
+                } else {
+                    Err(Diagnostic::error("pattern type is not a struct").with_span(*span))
                 }
-                Ok(HirPattern::Struct {
-                    path: path.clone(),
-                    fields: hir_fields,
-                    span: *span,
-                })
             }
             Pattern::Enum {
                 path,
@@ -605,17 +626,35 @@ impl<'a> TypeChecker<'a> {
                 inner,
                 span,
             } => {
-                let inner_hir = if let Some(inner) = inner {
-                    Some(Box::new(self.check_pattern(inner, self.ctx.error())?))
+                let def_id = self.resolve_def_id(path)?;
+                let binding = self
+                    .symbols
+                    .lookup_type_by_def_id(def_id)
+                    .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
+                if let TypeKind::Enum = binding.kind {
+                    let variant_def = binding
+                        .variants
+                        .iter()
+                        .find(|v| v.name == *variant)
+                        .ok_or_else(|| {
+                            Diagnostic::error(format!("variant '{}' not found", variant))
+                                .with_span(*span)
+                        })?;
+                    let inner_hir = if let Some(inner) = inner {
+                        let inner_ty = variant_def.payload.unwrap_or(self.ctx.error());
+                        Some(Box::new(self.check_pattern(inner, inner_ty)?))
+                    } else {
+                        None
+                    };
+                    Ok(HirPattern::Enum {
+                        path: path.clone(),
+                        variant: variant.clone(),
+                        inner: inner_hir,
+                        span: *span,
+                    })
                 } else {
-                    None
-                };
-                Ok(HirPattern::Enum {
-                    path: path.clone(),
-                    variant: variant.clone(),
-                    inner: inner_hir,
-                    span: *span,
-                })
+                    Err(Diagnostic::error("pattern type is not an enum").with_span(*span))
+                }
             }
             Pattern::Or(patterns, span) => {
                 let mut hir_patterns = Vec::new();
@@ -861,20 +900,44 @@ impl<'a> TypeChecker<'a> {
                 ))
             }
             Expr::StructLit { path, fields, span } => {
+                let def_id = self.resolve_def_id(path)?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
+                    Diagnostic::error(format!("struct not found: {:?}", path)).with_span(*span)
+                })?;
+                let type_args = self.collect_type_args(path, span)?;
+                let struct_ty = self.ctx.struct_ty(def_id, type_args);
+                let mut subst = Subst::new();
+                for (i, param) in binding.params.iter().enumerate() {
+                    if let Some(&arg) = type_args.get(i) {
+                        subst.insert(i, arg);
+                    }
+                }
+
                 let mut hir_fields = Vec::new();
                 for (name, value) in fields {
+                    let field_def =
+                        binding
+                            .fields
+                            .iter()
+                            .find(|f| f.name == *name)
+                            .ok_or_else(|| {
+                                Diagnostic::error(format!("field '{}' not found", name))
+                                    .with_span(*span)
+                            })?;
+                    let field_ty = self.ctx.subst(field_def.ty, &subst);
                     let (hir, _) = self.synthesize(value)?;
+                    self.unify(field_ty, hir.ty(), *span)?;
                     hir_fields.push((name.clone(), Box::new(hir)));
                 }
-                let ty = self.ctx.int(32, true);
+
                 Ok((
                     HirExpr::StructLit {
                         path: path.clone(),
                         fields: hir_fields,
-                        ty,
+                        ty: struct_ty,
                         span: *span,
                     },
-                    ty,
+                    struct_ty,
                 ))
             }
             Expr::EnumLit {
@@ -883,21 +946,47 @@ impl<'a> TypeChecker<'a> {
                 payload,
                 span,
             } => {
+                let def_id = self.resolve_def_id(path)?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
+                    Diagnostic::error(format!("enum not found: {:?}", path)).with_span(*span)
+                })?;
+                let type_args = self.collect_type_args(path, span)?;
+                let enum_ty = self.ctx.enum_ty(def_id, type_args);
+                let mut subst = Subst::new();
+                for (i, param) in binding.params.iter().enumerate() {
+                    if let Some(&arg) = type_args.get(i) {
+                        subst.insert(i, arg);
+                    }
+                }
+
                 let payload_hir = if let Some(payload) = payload {
-                    Some(Box::new(self.synthesize(payload)?.0))
+                    let variant_def = binding
+                        .variants
+                        .iter()
+                        .find(|v| v.name == *variant)
+                        .ok_or_else(|| {
+                            Diagnostic::error(format!("variant '{}' not found", variant))
+                                .with_span(*span)
+                        })?;
+                    let payload_ty = variant_def
+                        .payload
+                        .map_or(self.ctx.error(), |t| self.ctx.subst(t, &subst));
+                    let (hir, _) = self.synthesize(payload)?;
+                    self.unify(payload_ty, hir.ty(), *span)?;
+                    Some(Box::new(hir))
                 } else {
                     None
                 };
-                let ty = self.ctx.int(32, true);
+
                 Ok((
                     HirExpr::EnumLit {
                         path: path.clone(),
                         variant: variant.clone(),
                         payload: payload_hir,
-                        ty,
+                        ty: enum_ty,
                         span: *span,
                     },
-                    ty,
+                    enum_ty,
                 ))
             }
             Expr::Move(expr, span) => {
@@ -1186,14 +1275,24 @@ impl<'a> TypeChecker<'a> {
     fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
         match ty {
             Type::Path(path, span) => {
-                if let Some(def_id) = self.symbols.lookup_type_by_path(path) {
-                    let ty = self.ctx.int(32, true);
-                    Ok(ty)
-                } else {
-                    Err(
-                        Diagnostic::error(format!("undefined type: {}", path.join("::")))
-                            .with_span(*span),
-                    )
+                let def_id = self.resolve_def_id(path)?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
+                    Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span)
+                })?;
+                match binding.kind {
+                    TypeKind::Alias => Ok(binding.alias_body.unwrap_or(self.ctx.error())),
+                    TypeKind::Struct => {
+                        let args = self.collect_type_args(path, span)?;
+                        Ok(self.ctx.struct_ty(def_id, args))
+                    }
+                    TypeKind::Enum => {
+                        let args = self.collect_type_args(path, span)?;
+                        Ok(self.ctx.enum_ty(def_id, args))
+                    }
+                    _ => {
+                        Err(Diagnostic::error("expected type, found something else")
+                            .with_span(*span))
+                    }
                 }
             }
             Type::Generic(base, args, span) => {
@@ -1202,7 +1301,42 @@ impl<'a> TypeChecker<'a> {
                 for arg in args {
                     arg_tys.push(self.resolve_type(arg)?);
                 }
-                Ok(self.ctx.int(32, true))
+                match self.ctx.get(base_ty) {
+                    TypeData::Struct { def_id, .. } => {
+                        let binding =
+                            self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| {
+                                Diagnostic::error("struct definition not found").with_span(*span)
+                            })?;
+                        if arg_tys.len() != binding.params.len() {
+                            return Err(Diagnostic::error(format!(
+                                "wrong number of type arguments: expected {}, got {}",
+                                binding.params.len(),
+                                arg_tys.len()
+                            ))
+                            .with_span(*span));
+                        }
+                        Ok(self.ctx.struct_ty(*def_id, arg_tys))
+                    }
+                    TypeData::Enum { def_id, .. } => {
+                        let binding =
+                            self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| {
+                                Diagnostic::error("enum definition not found").with_span(*span)
+                            })?;
+                        if arg_tys.len() != binding.params.len() {
+                            return Err(Diagnostic::error(format!(
+                                "wrong number of type arguments: expected {}, got {}",
+                                binding.params.len(),
+                                arg_tys.len()
+                            ))
+                            .with_span(*span));
+                        }
+                        Ok(self.ctx.enum_ty(*def_id, arg_tys))
+                    }
+                    _ => Err(
+                        Diagnostic::error("generic type arguments on non-generic type")
+                            .with_span(*span),
+                    ),
+                }
             }
             Type::Reference(ty, mutable, span) => {
                 let inner = self.resolve_type(ty)?;
@@ -1250,7 +1384,7 @@ impl<'a> TypeChecker<'a> {
                 let mut trait_ids = Vec::new();
                 for t in traits {
                     if let Type::Path(path, _) = t {
-                        if let Some(def_id) = self.symbols.lookup_trait_by_path(path) {
+                        if let Some(def_id) = self.resolve_def_id(path).ok() {
                             trait_ids.push(def_id);
                         }
                     }
@@ -1290,6 +1424,32 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn collect_type_args(&self, path: &[String], span: Span) -> Result<Vec<TypeId>, Diagnostic> {
+        if path.len() > 1 {
+            return Err(Diagnostic::error("nested paths not supported yet").with_span(span));
+        }
+        Ok(Vec::new())
+    }
+
+    fn resolve_def_id(&self, path: &[String]) -> Result<DefId, Diagnostic> {
+        if path.is_empty() {
+            return Err(Diagnostic::error("empty path").with_span(Span::new(0, 0)));
+        }
+        let name = &path[0];
+        if let Some(binding) = self.symbols.lookup_type(name) {
+            if path.len() == 1 {
+                return Ok(binding.def_id);
+            }
+            Err(Diagnostic::error(format!(
+                "nested paths not supported yet: {}",
+                path.join("::")
+            ))
+            .with_span(Span::new(0, 0)))
+        } else {
+            Err(Diagnostic::error(format!("type '{}' not found", name)).with_span(Span::new(0, 0)))
+        }
+    }
+
     fn unify(
         &mut self,
         expected: TypeId,
@@ -1298,7 +1458,7 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<TypeId, Diagnostic> {
         match self.ctx.unify(expected, actual) {
             Ok(ty) => Ok(ty),
-            Err(_) => Err(Diagnostic::error(format!(
+            Err(err) => Err(Diagnostic::error(format!(
                 "type mismatch: expected {:?}, found {:?}",
                 self.ctx.get(expected),
                 self.ctx.get(actual)
@@ -1510,12 +1670,27 @@ impl<'a> TypeChecker<'a> {
 
     fn lookup_field(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
         if let TypeData::Struct { def_id, args } = self.ctx.get(ty) {
-            if let Some(field_ty) = self.symbols.lookup_field(*def_id, name) {
-                let subst = Subst::new();
-                return Ok(self.ctx.subst(field_ty, &subst));
+            let binding = self
+                .symbols
+                .lookup_type_by_def_id(*def_id)
+                .ok_or_else(|| Diagnostic::error("struct definition not found").with_span(span))?;
+            let field = binding
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .ok_or_else(|| {
+                    Diagnostic::error(format!("field '{}' not found", name)).with_span(span)
+                })?;
+            let mut subst = Subst::new();
+            for (i, param) in binding.params.iter().enumerate() {
+                if let Some(&arg) = args.get(i) {
+                    subst.insert(i, arg);
+                }
             }
+            Ok(self.ctx.subst(field.ty, &subst))
+        } else {
+            Err(Diagnostic::error("field access on non-struct type").with_span(span))
         }
-        Err(Diagnostic::error(format!("field '{}' not found", name)).with_span(span))
     }
 
     fn lookup_attr(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
@@ -1569,44 +1744,6 @@ impl<'a> TypeChecker<'a> {
             Literal::String(_) => self.ctx.slice(self.ctx.byte()),
             Literal::ByteString(_) => self.ctx.slice(self.ctx.byte()),
             Literal::Bool(_) => self.ctx.bool(),
-        }
-    }
-}
-
-trait HirNode {
-    fn ty(&self) -> TypeId;
-}
-
-impl HirNode for HirExpr {
-    fn ty(&self) -> TypeId {
-        match self {
-            HirExpr::Literal(_, ty, _) => *ty,
-            HirExpr::Ident(_, ty, _) => *ty,
-            HirExpr::TypeAnnotated { ty, .. } => *ty,
-            HirExpr::BinaryOp { ty, .. } => *ty,
-            HirExpr::UnaryOp { ty, .. } => *ty,
-            HirExpr::Call { ty, .. } => *ty,
-            HirExpr::Index { ty, .. } => *ty,
-            HirExpr::FieldAccess { ty, .. } => *ty,
-            HirExpr::AttrAccess { ty, .. } => *ty,
-            HirExpr::Cast { ty, .. } => *ty,
-            HirExpr::Range { ty, .. } => *ty,
-            HirExpr::StructLit { ty, .. } => *ty,
-            HirExpr::EnumLit { ty, .. } => *ty,
-            HirExpr::Move(_, ty, _) => *ty,
-            HirExpr::Tuple(_, ty, _) => *ty,
-            HirExpr::Array(_, ty, _) => *ty,
-            HirExpr::Closure { ty, .. } => *ty,
-            HirExpr::Try { ty, .. } => *ty,
-            HirExpr::UnsafeBlock { ty, .. } => *ty,
-            HirExpr::Catch { ty, .. } => *ty,
-            HirExpr::LeaveWith { ty, .. } => *ty,
-            HirExpr::Await { ty, .. } => *ty,
-            HirExpr::If { ty, .. } => *ty,
-            HirExpr::IfLet { ty, .. } => *ty,
-            HirExpr::Match { ty, .. } => *ty,
-            HirExpr::Block(_, ty, _) => *ty,
-            HirExpr::Error(_) => self.ty(),
         }
     }
 }
