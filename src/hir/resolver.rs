@@ -11,7 +11,6 @@ pub struct NameResolver<'a> {
     current_function: Option<DefId>,
     current_type: Option<DefId>,
     import_map: Vec<ImportEntry>,
-    next_def_id: usize,
 }
 
 struct ImportEntry {
@@ -31,7 +30,6 @@ impl<'a> NameResolver<'a> {
             current_function: None,
             current_type: None,
             import_map: Vec::new(),
-            next_def_id: 0,
         }
     }
 
@@ -136,7 +134,7 @@ impl<'a> NameResolver<'a> {
 
                 let mut fields = Vec::new();
                 let mut variants = Vec::new();
-                let mut alias_body = None;
+                let mut alias_ast = None;
 
                 match definition {
                     TypeDefinition::Struct(fields_def) => {
@@ -146,8 +144,7 @@ impl<'a> NameResolver<'a> {
                         variants = variants_def.clone();
                     }
                     TypeDefinition::Alias(ty, _) => {
-                        let resolved = self.resolve_type_expr(ty);
-                        alias_body = Some(resolved);
+                        alias_ast = Some(ty.clone());
                     }
                     _ => {}
                 }
@@ -157,7 +154,7 @@ impl<'a> NameResolver<'a> {
                     params: type_params,
                     kind,
                     span: *span,
-                    alias_body,
+                    alias_ast,
                     fields,
                     variants,
                 };

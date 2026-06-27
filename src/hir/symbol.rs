@@ -53,7 +53,7 @@ pub struct TypeBinding {
     pub params: Vec<TypeParam>,
     pub kind: TypeKind,
     pub span: Span,
-    pub alias_body: Option<TypeId>,
+    pub alias_ast: Option<Type>,
     pub fields: Vec<StructField>,
     pub variants: Vec<EnumVariant>,
 }

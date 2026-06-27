@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -58,10 +58,6 @@ pub enum TypeData {
         name: String,
         base: TypeId,
     },
-    Alias {
-        def_id: DefId,
-        args: Vec<TypeId>,
-    },
     GenericParam {
         index: usize,
         name: String,
@@ -84,55 +80,7 @@ pub struct TypeContext {
     type_map: HashMap<TypeData, TypeId>,
     bindings: HashMap<TypeId, TypeId>,
     invariants: HashMap<TypeId, Expr>,
-    alias_cache: HashMap<(DefId, Vec<TypeId>), TypeId>,
-    instantiate_cache: HashMap<(DefId, Vec<TypeId>), TypeId>,
-    symbol_provider: Option<Box<dyn SymbolProvider>>,
-    expanding: HashSet<DefId>,
-}
-
-#[derive(Debug, Clone)]
-pub enum AliasError {
-    NotFound(DefId),
-    ParameterCountMismatch {
-        expected: usize,
-        found: usize,
-        def_id: DefId,
-    },
-    Recursive(DefId),
-    SymbolProviderNotSet,
-}
-
-pub trait SymbolProvider {
-    fn get_alias_body(&self, def_id: DefId) -> Option<(Vec<TypeParam>, TypeId)>;
-    fn get_struct_definition(&self, def_id: DefId) -> Option<(Vec<TypeParam>, Vec<StructField>)>;
-    fn get_enum_definition(&self, def_id: DefId) -> Option<(Vec<TypeParam>, Vec<EnumVariant>)>;
-    fn is_type_alias(&self, def_id: DefId) -> bool;
-}
-
-struct ExpandingGuard<'a> {
-    ctx: &'a mut TypeContext,
-    def_id: DefId,
-    removed: bool,
-}
-
-impl<'a> ExpandingGuard<'a> {
-    fn new(ctx: &'a mut TypeContext, def_id: DefId) -> Self {
-        ctx.expanding.insert(def_id);
-        ExpandingGuard {
-            ctx,
-            def_id,
-            removed: false,
-        }
-    }
-}
-
-impl<'a> Drop for ExpandingGuard<'a> {
-    fn drop(&mut self) {
-        if !self.removed {
-            self.ctx.expanding.remove(&self.def_id);
-            self.removed = true;
-        }
-    }
+    def_id_to_type_id: HashMap<DefId, TypeId>,
 }
 
 impl TypeContext {
@@ -142,10 +90,7 @@ impl TypeContext {
             type_map: HashMap::new(),
             bindings: HashMap::new(),
             invariants: HashMap::new(),
-            alias_cache: HashMap::new(),
-            instantiate_cache: HashMap::new(),
-            symbol_provider: None,
-            expanding: HashSet::new(),
+            def_id_to_type_id: HashMap::new(),
         };
         let unit = ctx.alloc(TypeData::Unit);
         let never = ctx.alloc(TypeData::Never);
@@ -155,10 +100,6 @@ impl TypeContext {
         let byte_ty = ctx.alloc(TypeData::Byte);
         let usize_ty = ctx.alloc(TypeData::USize);
         ctx
-    }
-
-    pub fn set_symbol_provider(&mut self, provider: impl SymbolProvider + 'static) {
-        self.symbol_provider = Some(Box::new(provider));
     }
 
     pub fn get_invariant(&self, id: TypeId) -> Option<&Expr> {
@@ -189,6 +130,22 @@ impl TypeContext {
         } else {
             &self.types[id.0]
         }
+    }
+
+    pub fn get_def_id_for_type(&self, id: TypeId) -> Option<DefId> {
+        match self.resolve_binding(id) {
+            TypeData::Struct { def_id, .. } => Some(*def_id),
+            TypeData::Enum { def_id, .. } => Some(*def_id),
+            _ => None,
+        }
+    }
+
+    pub fn register_def_id(&mut self, def_id: DefId, type_id: TypeId) {
+        self.def_id_to_type_id.insert(def_id, type_id);
+    }
+
+    pub fn get_type_id_for_def_id(&self, def_id: DefId) -> Option<TypeId> {
+        self.def_id_to_type_id.get(&def_id).copied()
     }
 
     pub fn int(&mut self, bits: u8, signed: bool) -> TypeId {
@@ -232,11 +189,15 @@ impl TypeContext {
     }
 
     pub fn struct_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        self.alloc(TypeData::Struct { def_id, args })
+        let id = self.alloc(TypeData::Struct { def_id, args });
+        self.def_id_to_type_id.insert(def_id, id);
+        id
     }
 
     pub fn enum_ty(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        self.alloc(TypeData::Enum { def_id, args })
+        let id = self.alloc(TypeData::Enum { def_id, args });
+        self.def_id_to_type_id.insert(def_id, id);
+        id
     }
 
     pub fn tuple(&mut self, elems: Vec<TypeId>) -> TypeId {
@@ -277,10 +238,6 @@ impl TypeContext {
         id
     }
 
-    pub fn alias(&mut self, def_id: DefId, args: Vec<TypeId>) -> TypeId {
-        self.alloc(TypeData::Alias { def_id, args })
-    }
-
     pub fn generic_param(&mut self, index: usize, name: String) -> TypeId {
         self.alloc(TypeData::GenericParam { index, name })
     }
@@ -313,7 +270,6 @@ impl TypeContext {
                 params.iter().any(|&p| self.occurs_check(param, p))
                     || self.occurs_check(param, *ret)
             }
-            TypeData::Alias { args, .. } => args.iter().any(|&a| self.occurs_check(param, a)),
             TypeData::Exists { base, .. } => self.occurs_check(param, *base),
             TypeData::AssociatedType { self_ty, .. } => self.occurs_check(param, *self_ty),
             TypeData::GenericParam { .. } => false,
@@ -338,76 +294,6 @@ impl TypeContext {
             return Ok(a);
         }
 
-        if let TypeData::Alias { def_id, args } = &data_a {
-            match self.expand_alias_def(*def_id, args.clone()) {
-                Ok(expanded) => return self.unify(expanded, b),
-                Err(AliasError::NotFound(_)) => {
-                    return Err(TypeError::TypeNotFound {
-                        name: format!("alias {:?}", def_id),
-                        span: Span::new(0, 0),
-                    });
-                }
-                Err(AliasError::ParameterCountMismatch {
-                    expected,
-                    found,
-                    def_id,
-                }) => {
-                    return Err(TypeError::GenericArgumentCount {
-                        expected,
-                        found,
-                        span: Span::new(0, 0),
-                    });
-                }
-                Err(AliasError::Recursive(def_id)) => {
-                    return Err(TypeError::CircularDependency {
-                        name: format!("alias {:?}", def_id),
-                        span: Span::new(0, 0),
-                    });
-                }
-                Err(AliasError::SymbolProviderNotSet) => {
-                    return Err(TypeError::TypeNotFound {
-                        name: format!("alias {:?} (symbol provider not set)", def_id),
-                        span: Span::new(0, 0),
-                    });
-                }
-            }
-        }
-
-        if let TypeData::Alias { def_id, args } = &data_b {
-            match self.expand_alias_def(*def_id, args.clone()) {
-                Ok(expanded) => return self.unify(a, expanded),
-                Err(AliasError::NotFound(_)) => {
-                    return Err(TypeError::TypeNotFound {
-                        name: format!("alias {:?}", def_id),
-                        span: Span::new(0, 0),
-                    });
-                }
-                Err(AliasError::ParameterCountMismatch {
-                    expected,
-                    found,
-                    def_id,
-                }) => {
-                    return Err(TypeError::GenericArgumentCount {
-                        expected,
-                        found,
-                        span: Span::new(0, 0),
-                    });
-                }
-                Err(AliasError::Recursive(def_id)) => {
-                    return Err(TypeError::CircularDependency {
-                        name: format!("alias {:?}", def_id),
-                        span: Span::new(0, 0),
-                    });
-                }
-                Err(AliasError::SymbolProviderNotSet) => {
-                    return Err(TypeError::TypeNotFound {
-                        name: format!("alias {:?} (symbol provider not set)", def_id),
-                        span: Span::new(0, 0),
-                    });
-                }
-            }
-        }
-
         match (&data_a, &data_b) {
             (TypeData::Error, _) => Ok(b),
             (_, TypeData::Error) => Ok(a),
@@ -415,13 +301,7 @@ impl TypeContext {
                 TypeData::GenericParam { index: i1, .. },
                 TypeData::GenericParam { index: i2, .. },
             ) if i1 == i2 => Ok(a),
-            (
-                TypeData::GenericParam {
-                    index: i1,
-                    name: n1,
-                },
-                _,
-            ) => {
+            (TypeData::GenericParam { .. }, _) => {
                 if self.occurs_check(a, b) {
                     return Err(TypeError::RecursiveType {
                         ty: a,
@@ -429,21 +309,9 @@ impl TypeContext {
                     });
                 }
                 self.bindings.insert(a, b);
-                self.type_map.remove(&TypeData::GenericParam {
-                    index: *i1,
-                    name: n1.clone(),
-                });
-                self.alias_cache.clear();
-                self.instantiate_cache.clear();
                 Ok(b)
             }
-            (
-                _,
-                TypeData::GenericParam {
-                    index: i2,
-                    name: n2,
-                },
-            ) => {
+            (_, TypeData::GenericParam { .. }) => {
                 if self.occurs_check(b, a) {
                     return Err(TypeError::RecursiveType {
                         ty: b,
@@ -451,12 +319,6 @@ impl TypeContext {
                     });
                 }
                 self.bindings.insert(b, a);
-                self.type_map.remove(&TypeData::GenericParam {
-                    index: *i2,
-                    name: n2.clone(),
-                });
-                self.alias_cache.clear();
-                self.instantiate_cache.clear();
                 Ok(a)
             }
             _ => Err(TypeError::Mismatch {
@@ -465,44 +327,6 @@ impl TypeContext {
                 span: Span::new(0, 0),
             }),
         }
-    }
-
-    fn expand_alias_def(&mut self, def_id: DefId, args: Vec<TypeId>) -> Result<TypeId, AliasError> {
-        let cache_key = (def_id, args.clone());
-        if let Some(&cached) = self.alias_cache.get(&cache_key) {
-            return Ok(cached);
-        }
-
-        if self.expanding.contains(&def_id) {
-            return Err(AliasError::Recursive(def_id));
-        }
-
-        let _guard = ExpandingGuard::new(self, def_id);
-
-        let provider = self
-            .symbol_provider
-            .as_ref()
-            .ok_or(AliasError::SymbolProviderNotSet)?;
-        let (params, body) = provider
-            .get_alias_body(def_id)
-            .ok_or(AliasError::NotFound(def_id))?;
-
-        if params.len() != args.len() {
-            return Err(AliasError::ParameterCountMismatch {
-                expected: params.len(),
-                found: args.len(),
-                def_id,
-            });
-        }
-
-        let mut subst = Subst::new();
-        for (i, _) in params.iter().enumerate() {
-            subst.insert(i, args[i]);
-        }
-        let expanded = self.subst(body, &subst);
-
-        self.alias_cache.insert(cache_key, expanded);
-        Ok(expanded)
     }
 
     pub fn subtype(&mut self, sub: TypeId, sup: TypeId) -> bool {
@@ -518,20 +342,6 @@ impl TypeContext {
             (_, TypeData::Error) => true,
             (TypeData::Never, _) => true,
             (TypeData::Unit, TypeData::Unit) => true,
-            (TypeData::Alias { def_id, args }, _) => {
-                if let Ok(expanded) = self.expand_alias_def(*def_id, args.clone()) {
-                    self.subtype(expanded, *sup)
-                } else {
-                    false
-                }
-            }
-            (_, TypeData::Alias { def_id, args }) => {
-                if let Ok(expanded) = self.expand_alias_def(*def_id, args.clone()) {
-                    self.subtype(*sub, expanded)
-                } else {
-                    false
-                }
-            }
             (
                 TypeData::Ref {
                     ty: t1,
@@ -597,7 +407,7 @@ impl TypeContext {
         self.type_map.get(data).copied()
     }
 
-    pub fn subst(&self, ty: TypeId, subst: &Subst) -> TypeId {
+    pub fn subst(&mut self, ty: TypeId, subst: &Subst) -> TypeId {
         match self.resolve_binding(ty) {
             TypeData::GenericParam { index, .. } => subst.get(*index).copied().unwrap_or(ty),
             TypeData::Int { bits, signed } => {
@@ -605,18 +415,13 @@ impl TypeContext {
                     bits: *bits,
                     signed: *signed,
                 };
-                self.find_type(&data).unwrap_or_else(|| {
-                    panic!(
-                        "Int type with bits={} signed={} not found in intern table",
-                        bits, signed
-                    )
-                })
+                self.find_type(&data)
+                    .expect("built-in Int type should exist")
             }
             TypeData::Float { bits } => {
                 let data = TypeData::Float { bits: *bits };
-                self.find_type(&data).unwrap_or_else(|| {
-                    panic!("Float type with bits={} not found in intern table", bits)
-                })
+                self.find_type(&data)
+                    .expect("built-in Float type should exist")
             }
             TypeData::Bool
             | TypeData::Char
@@ -628,109 +433,56 @@ impl TypeContext {
             TypeData::Struct { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
                 self.struct_ty_no_alloc(*def_id, new_args)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Struct type with def_id={:?} and args={:?} not found in intern table",
-                            def_id, new_args
-                        )
-                    })
+                    .expect("struct type should exist")
             }
             TypeData::Enum { def_id, args } => {
                 let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.enum_ty_no_alloc(*def_id, new_args).unwrap_or_else(|| {
-                    panic!(
-                        "Enum type with def_id={:?} and args={:?} not found in intern table",
-                        def_id, new_args
-                    )
-                })
+                self.enum_ty_no_alloc(*def_id, new_args)
+                    .expect("enum type should exist")
             }
             TypeData::Tuple { elems } => {
                 let new_elems: Vec<TypeId> = elems.iter().map(|&e| self.subst(e, subst)).collect();
-                self.tuple_ty_no_alloc(new_elems).unwrap_or_else(|| {
-                    panic!(
-                        "Tuple type with elems={:?} not found in intern table",
-                        new_elems
-                    )
-                })
+                self.tuple_ty_no_alloc(new_elems)
+                    .expect("tuple type should exist")
             }
             TypeData::Array { elem, size } => {
                 let new_elem = self.subst(*elem, subst);
-                self.array_ty_no_alloc(new_elem, *size).unwrap_or_else(|| {
-                    panic!(
-                        "Array type with elem={:?} size={} not found in intern table",
-                        new_elem, size
-                    )
-                })
+                self.array_ty_no_alloc(new_elem, *size)
+                    .expect("array type should exist")
             }
             TypeData::Slice { elem } => {
                 let new_elem = self.subst(*elem, subst);
-                self.slice_ty_no_alloc(new_elem).unwrap_or_else(|| {
-                    panic!(
-                        "Slice type with elem={:?} not found in intern table",
-                        new_elem
-                    )
-                })
+                self.slice_ty_no_alloc(new_elem)
+                    .expect("slice type should exist")
             }
             TypeData::Ref { ty, mutable } => {
                 let new_ty = self.subst(*ty, subst);
-                self.ref_ty_no_alloc(new_ty, *mutable).unwrap_or_else(|| {
-                    panic!(
-                        "Ref type with ty={:?} mutable={} not found in intern table",
-                        new_ty, mutable
-                    )
-                })
+                self.ref_ty_no_alloc(new_ty, *mutable)
+                    .expect("ref type should exist")
             }
             TypeData::Pointer { ty } => {
                 let new_ty = self.subst(*ty, subst);
-                self.pointer_ty_no_alloc(new_ty).unwrap_or_else(|| {
-                    panic!(
-                        "Pointer type with ty={:?} not found in intern table",
-                        new_ty
-                    )
-                })
+                self.pointer_ty_no_alloc(new_ty)
+                    .expect("pointer type should exist")
             }
             TypeData::Ptr { size, pointee } => {
                 let new_size = self.subst(*size, subst);
                 let new_pointee = self.subst(*pointee, subst);
                 self.ptr_ty_no_alloc(new_size, new_pointee)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Ptr type with size={:?} pointee={:?} not found in intern table",
-                            new_size, new_pointee
-                        )
-                    })
+                    .expect("ptr type should exist")
             }
             TypeData::Fn { params, ret } => {
                 let new_params: Vec<TypeId> =
                     params.iter().map(|&p| self.subst(p, subst)).collect();
                 let new_ret = self.subst(*ret, subst);
-                self.fn_ty_no_alloc(new_params, new_ret).unwrap_or_else(|| {
-                    panic!(
-                        "Fn type with params={:?} ret={:?} not found in intern table",
-                        new_params, new_ret
-                    )
-                })
+                self.fn_ty_no_alloc(new_params, new_ret)
+                    .expect("function type should exist")
             }
             TypeData::DynTrait { traits } => ty,
             TypeData::Exists { name, base } => {
                 let new_base = self.subst(*base, subst);
                 self.exists_ty_no_alloc(name.clone(), new_base)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Exists type with name={:?} base={:?} not found in intern table",
-                            name, new_base
-                        )
-                    })
-            }
-            TypeData::Alias { def_id, args } => {
-                let new_args: Vec<TypeId> = args.iter().map(|&a| self.subst(a, subst)).collect();
-                self.alias_ty_no_alloc(*def_id, new_args)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Alias type with def_id={:?} args={:?} not found in intern table",
-                            def_id, new_args
-                        )
-                    })
+                    .expect("exists type should exist")
             }
             TypeData::AssociatedType {
                 trait_id,
@@ -739,12 +491,7 @@ impl TypeContext {
             } => {
                 let new_self = self.subst(*self_ty, subst);
                 self.associated_ty_no_alloc(*trait_id, name.clone(), new_self)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "AssociatedType with trait_id={:?} name={:?} self_ty={:?} not found",
-                            trait_id, name, new_self
-                        )
-                    })
+                    .expect("associated type should exist")
             }
             _ => ty,
         }
@@ -790,10 +537,6 @@ impl TypeContext {
         self.find_type(&TypeData::Exists { name, base })
     }
 
-    fn alias_ty_no_alloc(&self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        self.find_type(&TypeData::Alias { def_id, args })
-    }
-
     fn associated_ty_no_alloc(
         &self,
         trait_id: DefId,
@@ -807,56 +550,21 @@ impl TypeContext {
         })
     }
 
-    pub fn instantiate(&mut self, def_id: DefId, args: Vec<TypeId>) -> Option<TypeId> {
-        let cache_key = (def_id, args.clone());
-        if let Some(&cached) = self.instantiate_cache.get(&cache_key) {
-            return Some(cached);
-        }
-
-        let provider = self.symbol_provider.as_ref()?;
-
-        if provider.is_type_alias(def_id) {
-            let result = self.expand_alias_def(def_id, args).ok()?;
-            self.instantiate_cache.insert(cache_key, result);
-            return Some(result);
-        }
-
-        if let Some((params, _)) = provider.get_struct_definition(def_id) {
-            if params.len() != args.len() {
-                return None;
-            }
-            let result = self.struct_ty(def_id, args);
-            self.instantiate_cache.insert(cache_key, result);
-            return Some(result);
-        }
-
-        if let Some((params, _)) = provider.get_enum_definition(def_id) {
-            if params.len() != args.len() {
-                return None;
-            }
-            let result = self.enum_ty(def_id, args);
-            self.instantiate_cache.insert(cache_key, result);
-            return Some(result);
-        }
-
-        None
-    }
-
-    pub fn is_numeric(&self, ty: TypeId) -> bool {
+    pub fn is_numeric(&mut self, ty: TypeId) -> bool {
         match self.resolve_binding(ty) {
             TypeData::Int { .. } | TypeData::Float { .. } => true,
             _ => false,
         }
     }
 
-    pub fn is_integer(&self, ty: TypeId) -> bool {
+    pub fn is_integer(&mut self, ty: TypeId) -> bool {
         match self.resolve_binding(ty) {
             TypeData::Int { .. } | TypeData::USize => true,
             _ => false,
         }
     }
 
-    pub fn is_unsigned(&self, ty: TypeId) -> bool {
+    pub fn is_unsigned(&mut self, ty: TypeId) -> bool {
         match self.resolve_binding(ty) {
             TypeData::Int { signed, .. } => !signed,
             TypeData::USize => true,
@@ -864,189 +572,185 @@ impl TypeContext {
         }
     }
 
-    pub fn is_signed(&self, ty: TypeId) -> bool {
+    pub fn is_signed(&mut self, ty: TypeId) -> bool {
         match self.resolve_binding(ty) {
             TypeData::Int { signed, .. } => *signed,
             _ => false,
         }
     }
 
-    pub fn is_float(&self, ty: TypeId) -> bool {
+    pub fn is_float(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Float { .. })
     }
 
-    pub fn is_bool(&self, ty: TypeId) -> bool {
+    pub fn is_bool(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Bool)
     }
 
-    pub fn is_char(&self, ty: TypeId) -> bool {
+    pub fn is_char(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Char)
     }
 
-    pub fn is_byte(&self, ty: TypeId) -> bool {
+    pub fn is_byte(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Byte)
     }
 
-    pub fn is_usize(&self, ty: TypeId) -> bool {
+    pub fn is_usize(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::USize)
     }
 
-    pub fn is_unit(&self, ty: TypeId) -> bool {
+    pub fn is_unit(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Unit)
     }
 
-    pub fn is_never(&self, ty: TypeId) -> bool {
+    pub fn is_never(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Never)
     }
 
-    pub fn is_error(&self, ty: TypeId) -> bool {
+    pub fn is_error(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Error)
     }
 
-    pub fn is_reference(&self, ty: TypeId) -> bool {
+    pub fn is_reference(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Ref { .. })
     }
 
-    pub fn is_pointer(&self, ty: TypeId) -> bool {
+    pub fn is_pointer(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Pointer { .. })
     }
 
-    pub fn is_struct(&self, ty: TypeId) -> bool {
+    pub fn is_struct(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Struct { .. })
     }
 
-    pub fn is_enum(&self, ty: TypeId) -> bool {
+    pub fn is_enum(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Enum { .. })
     }
 
-    pub fn is_tuple(&self, ty: TypeId) -> bool {
+    pub fn is_tuple(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Tuple { .. })
     }
 
-    pub fn is_array(&self, ty: TypeId) -> bool {
+    pub fn is_array(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Array { .. })
     }
 
-    pub fn is_slice(&self, ty: TypeId) -> bool {
+    pub fn is_slice(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Slice { .. })
     }
 
-    pub fn is_fn(&self, ty: TypeId) -> bool {
+    pub fn is_fn(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Fn { .. })
     }
 
-    pub fn is_dyn_trait(&self, ty: TypeId) -> bool {
+    pub fn is_dyn_trait(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::DynTrait { .. })
     }
 
-    pub fn is_exists(&self, ty: TypeId) -> bool {
+    pub fn is_exists(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::Exists { .. })
     }
 
-    pub fn is_alias(&self, ty: TypeId) -> bool {
-        matches!(self.resolve_binding(ty), TypeData::Alias { .. })
-    }
-
-    pub fn is_generic_param(&self, ty: TypeId) -> bool {
+    pub fn is_generic_param(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::GenericParam { .. })
     }
 
-    pub fn is_associated_type(&self, ty: TypeId) -> bool {
+    pub fn is_associated_type(&mut self, ty: TypeId) -> bool {
         matches!(self.resolve_binding(ty), TypeData::AssociatedType { .. })
     }
 
-    pub fn bits_of_int(&self, ty: TypeId) -> Option<u8> {
+    pub fn bits_of_int(&mut self, ty: TypeId) -> Option<u8> {
         match self.resolve_binding(ty) {
             TypeData::Int { bits, .. } => Some(*bits),
             _ => None,
         }
     }
 
-    pub fn signedness_of_int(&self, ty: TypeId) -> Option<bool> {
+    pub fn signedness_of_int(&mut self, ty: TypeId) -> Option<bool> {
         match self.resolve_binding(ty) {
             TypeData::Int { signed, .. } => Some(*signed),
             _ => None,
         }
     }
 
-    pub fn bits_of_float(&self, ty: TypeId) -> Option<u8> {
+    pub fn bits_of_float(&mut self, ty: TypeId) -> Option<u8> {
         match self.resolve_binding(ty) {
             TypeData::Float { bits } => Some(*bits),
             _ => None,
         }
     }
 
-    pub fn size_of_array(&self, ty: TypeId) -> Option<u64> {
+    pub fn size_of_array(&mut self, ty: TypeId) -> Option<u64> {
         match self.resolve_binding(ty) {
             TypeData::Array { size, .. } => Some(*size),
             _ => None,
         }
     }
 
-    pub fn elem_of_array(&self, ty: TypeId) -> Option<TypeId> {
+    pub fn elem_of_array(&mut self, ty: TypeId) -> Option<TypeId> {
         match self.resolve_binding(ty) {
             TypeData::Array { elem, .. } => Some(*elem),
             _ => None,
         }
     }
 
-    pub fn elem_of_slice(&self, ty: TypeId) -> Option<TypeId> {
+    pub fn elem_of_slice(&mut self, ty: TypeId) -> Option<TypeId> {
         match self.resolve_binding(ty) {
             TypeData::Slice { elem } => Some(*elem),
             _ => None,
         }
     }
 
-    pub fn pointee_of_ref(&self, ty: TypeId) -> Option<TypeId> {
+    pub fn pointee_of_ref(&mut self, ty: TypeId) -> Option<TypeId> {
         match self.resolve_binding(ty) {
             TypeData::Ref { ty: t, .. } => Some(*t),
             _ => None,
         }
     }
 
-    pub fn mutability_of_ref(&self, ty: TypeId) -> Option<bool> {
+    pub fn mutability_of_ref(&mut self, ty: TypeId) -> Option<bool> {
         match self.resolve_binding(ty) {
             TypeData::Ref { mutable, .. } => Some(*mutable),
             _ => None,
         }
     }
 
-    pub fn pointee_of_pointer(&self, ty: TypeId) -> Option<TypeId> {
+    pub fn pointee_of_pointer(&mut self, ty: TypeId) -> Option<TypeId> {
         match self.resolve_binding(ty) {
             TypeData::Pointer { ty: t } => Some(*t),
             _ => None,
         }
     }
 
-    pub fn params_of_fn(&self, ty: TypeId) -> Option<&[TypeId]> {
+    pub fn params_of_fn(&mut self, ty: TypeId) -> Option<&[TypeId]> {
         match self.resolve_binding(ty) {
             TypeData::Fn { params, .. } => Some(params),
             _ => None,
         }
     }
 
-    pub fn ret_of_fn(&self, ty: TypeId) -> Option<TypeId> {
+    pub fn ret_of_fn(&mut self, ty: TypeId) -> Option<TypeId> {
         match self.resolve_binding(ty) {
             TypeData::Fn { ret, .. } => Some(*ret),
             _ => None,
         }
     }
 
-    pub fn tuple_elems(&self, ty: TypeId) -> Option<&[TypeId]> {
+    pub fn tuple_elems(&mut self, ty: TypeId) -> Option<&[TypeId]> {
         match self.resolve_binding(ty) {
             TypeData::Tuple { elems } => Some(elems),
             _ => None,
         }
     }
 
-    pub fn base_of_exists(&self, ty: TypeId) -> Option<TypeId> {
+    pub fn base_of_exists(&mut self, ty: TypeId) -> Option<TypeId> {
         match self.resolve_binding(ty) {
             TypeData::Exists { base, .. } => Some(*base),
             _ => None,
         }
     }
 
-    pub fn name_of_exists(&self, ty: TypeId) -> Option<&String> {
+    pub fn name_of_exists(&mut self, ty: TypeId) -> Option<&String> {
         match self.resolve_binding(ty) {
             TypeData::Exists { name, .. } => Some(name),
             _ => None,
@@ -1183,8 +887,5 @@ pub enum TypeError {
     },
 }
 
-use crate::ast::EnumVariant;
 use crate::ast::Expr;
 use crate::ast::Span;
-use crate::ast::StructField;
-use crate::ast::TypeParam;

@@ -1,9 +1,9 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::hir::*;
-use crate::hir::provider::*;
 use crate::hir::symbol::*;
 use crate::hir::types::*;
+use std::collections::HashSet;
 
 pub struct TypeChecker<'a> {
     ctx: &'a mut TypeContext,
@@ -16,6 +16,7 @@ pub struct TypeChecker<'a> {
     type_vars: Vec<TypeVariable>,
     constraints: Vec<TypeConstraint>,
     subst: Subst,
+    resolving_aliases: HashSet<DefId>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,8 +53,6 @@ pub enum ConstraintKind {
 
 impl<'a> TypeChecker<'a> {
     pub fn new(ctx: &'a mut TypeContext, symbols: &'a SymbolTable) -> Self {
-        let provider = SymbolProviderImpl::new(symbols);
-        ctx.set_symbol_provider(provider);
         TypeChecker {
             ctx,
             symbols,
@@ -65,6 +64,7 @@ impl<'a> TypeChecker<'a> {
             type_vars: Vec::new(),
             constraints: Vec::new(),
             subst: Subst::new(),
+            resolving_aliases: HashSet::new(),
         }
     }
 
@@ -112,9 +112,7 @@ impl<'a> TypeChecker<'a> {
 
                 let value_hir = if let Some(value) = value {
                     let (hir, inferred_ty) = self.synthesize(value)?;
-                    if ty_id != self.ctx.error() {
-                        self.unify(ty_id, inferred_ty, *span)?;
-                    }
+                    self.unify(ty_id, inferred_ty, *span)?;
                     Some(Box::new(hir))
                 } else {
                     None
@@ -597,13 +595,20 @@ impl<'a> TypeChecker<'a> {
                     .lookup_type_by_def_id(def_id)
                     .ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
                 if let TypeKind::Struct = binding.kind {
+                    let type_args = self.collect_type_args(path, span)?;
+                    let mut subst = Subst::new();
+                    for (i, param) in binding.params.iter().enumerate() {
+                        if let Some(&arg) = type_args.get(i) {
+                            subst.insert(i, arg);
+                        }
+                    }
                     let mut hir_fields = Vec::new();
                     for (name, pat) in fields {
                         let field_ty = binding
                             .fields
                             .iter()
                             .find(|f| f.name == *name)
-                            .map(|f| f.ty)
+                            .map(|f| self.ctx.subst(f.ty, &subst))
                             .ok_or_else(|| {
                                 Diagnostic::error(format!("field '{}' not found", name))
                                     .with_span(*span)
@@ -632,6 +637,13 @@ impl<'a> TypeChecker<'a> {
                     .lookup_type_by_def_id(def_id)
                     .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
                 if let TypeKind::Enum = binding.kind {
+                    let type_args = self.collect_type_args(path, span)?;
+                    let mut subst = Subst::new();
+                    for (i, param) in binding.params.iter().enumerate() {
+                        if let Some(&arg) = type_args.get(i) {
+                            subst.insert(i, arg);
+                        }
+                    }
                     let variant_def = binding
                         .variants
                         .iter()
@@ -640,8 +652,10 @@ impl<'a> TypeChecker<'a> {
                             Diagnostic::error(format!("variant '{}' not found", variant))
                                 .with_span(*span)
                         })?;
+                    let inner_ty = variant_def
+                        .payload
+                        .map_or(self.ctx.error(), |t| self.ctx.subst(t, &subst));
                     let inner_hir = if let Some(inner) = inner {
-                        let inner_ty = variant_def.payload.unwrap_or(self.ctx.error());
                         Some(Box::new(self.check_pattern(inner, inner_ty)?))
                     } else {
                         None
@@ -780,7 +794,6 @@ impl<'a> TypeChecker<'a> {
                     self.unify(expected, actual, arg.span())?;
                     hir_args.push(hir);
                 }
-
                 Ok((
                     HirExpr::Call {
                         callee: Box::new(callee_hir),
@@ -811,7 +824,6 @@ impl<'a> TypeChecker<'a> {
                     self.diagnostics
                         .push(Diagnostic::error("index must be an integer").with_span(*span));
                 }
-
                 Ok((
                     HirExpr::Index {
                         base: Box::new(base_hir),
@@ -905,7 +917,7 @@ impl<'a> TypeChecker<'a> {
                     Diagnostic::error(format!("struct not found: {:?}", path)).with_span(*span)
                 })?;
                 let type_args = self.collect_type_args(path, span)?;
-                let struct_ty = self.ctx.struct_ty(def_id, type_args);
+                let struct_ty = self.ctx.struct_ty(def_id, type_args.clone());
                 let mut subst = Subst::new();
                 for (i, param) in binding.params.iter().enumerate() {
                     if let Some(&arg) = type_args.get(i) {
@@ -951,7 +963,7 @@ impl<'a> TypeChecker<'a> {
                     Diagnostic::error(format!("enum not found: {:?}", path)).with_span(*span)
                 })?;
                 let type_args = self.collect_type_args(path, span)?;
-                let enum_ty = self.ctx.enum_ty(def_id, type_args);
+                let enum_ty = self.ctx.enum_ty(def_id, type_args.clone());
                 let mut subst = Subst::new();
                 for (i, param) in binding.params.iter().enumerate() {
                     if let Some(&arg) = type_args.get(i) {
@@ -1078,13 +1090,14 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::UnsafeBlock { body, span } => {
                 let body_hir = self.check_block(body)?;
+                let ty = self.ctx.unit();
                 Ok((
                     HirExpr::UnsafeBlock {
                         body: body_hir,
-                        ty: self.ctx.unit(),
+                        ty,
                         span: *span,
                     },
-                    self.ctx.unit(),
+                    ty,
                 ))
             }
             Expr::Catch {
@@ -1119,13 +1132,14 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::LeaveWith { expr, span } => {
                 let (hir, ty) = self.synthesize(expr)?;
+                let never = self.ctx.never();
                 Ok((
                     HirExpr::LeaveWith {
                         expr: Box::new(hir),
-                        ty: self.ctx.never(),
+                        ty: never,
                         span: *span,
                     },
-                    self.ctx.never(),
+                    never,
                 ))
             }
             Expr::Await { expr, span } => {
@@ -1202,17 +1216,17 @@ impl<'a> TypeChecker<'a> {
                     None
                 };
 
-                let result_ty = self.ctx.unit();
+                let ty = self.ctx.unit();
                 Ok((
                     HirExpr::IfLet {
                         pattern: pattern_hir,
                         scrutinee: Box::new(scrut_hir),
                         then_branch: then_hir,
                         else_branch: else_hir,
-                        ty: result_ty,
+                        ty,
                         span: *span,
                     },
-                    result_ty,
+                    ty,
                 ))
             }
             Expr::Match {
@@ -1280,7 +1294,21 @@ impl<'a> TypeChecker<'a> {
                     Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span)
                 })?;
                 match binding.kind {
-                    TypeKind::Alias => Ok(binding.alias_body.unwrap_or(self.ctx.error())),
+                    TypeKind::Alias => {
+                        if self.resolving_aliases.contains(&def_id) {
+                            return Err(
+                                Diagnostic::error("circular alias definition").with_span(*span)
+                            );
+                        }
+                        self.resolving_aliases.insert(def_id);
+                        let result = if let Some(ast) = &binding.alias_ast {
+                            self.resolve_type(ast)
+                        } else {
+                            Err(Diagnostic::error("alias has no body").with_span(*span))
+                        };
+                        self.resolving_aliases.remove(&def_id);
+                        result
+                    }
                     TypeKind::Struct => {
                         let args = self.collect_type_args(path, span)?;
                         Ok(self.ctx.struct_ty(def_id, args))
@@ -1297,11 +1325,12 @@ impl<'a> TypeChecker<'a> {
             }
             Type::Generic(base, args, span) => {
                 let base_ty = self.resolve_type(base)?;
+                let expanded_base = self.expand_base_type(base_ty, *span)?;
                 let mut arg_tys = Vec::new();
                 for arg in args {
                     arg_tys.push(self.resolve_type(arg)?);
                 }
-                match self.ctx.get(base_ty) {
+                match self.ctx.get(expanded_base) {
                     TypeData::Struct { def_id, .. } => {
                         let binding =
                             self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| {
@@ -1422,6 +1451,28 @@ impl<'a> TypeChecker<'a> {
             }
             Type::Error(span) => Ok(self.ctx.error()),
         }
+    }
+
+    fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
+        if let Some(def_id) = self.ctx.get_def_id_for_type(ty) {
+            let binding = self.symbols.lookup_type_by_def_id(def_id);
+            if let Some(binding) = binding {
+                if binding.kind == TypeKind::Alias {
+                    if self.resolving_aliases.contains(&def_id) {
+                        return Err(Diagnostic::error("circular alias definition").with_span(span));
+                    }
+                    self.resolving_aliases.insert(def_id);
+                    let result = if let Some(ast) = &binding.alias_ast {
+                        self.resolve_type(ast)
+                    } else {
+                        Err(Diagnostic::error("alias has no body").with_span(span))
+                    };
+                    self.resolving_aliases.remove(&def_id);
+                    return result;
+                }
+            }
+        }
+        Ok(ty)
     }
 
     fn collect_type_args(&self, path: &[String], span: Span) -> Result<Vec<TypeId>, Diagnostic> {
@@ -1687,7 +1738,8 @@ impl<'a> TypeChecker<'a> {
                     subst.insert(i, arg);
                 }
             }
-            Ok(self.ctx.subst(field.ty, &subst))
+            let field_ty = self.ctx.subst(field.ty, &subst);
+            Ok(field_ty)
         } else {
             Err(Diagnostic::error("field access on non-struct type").with_span(span))
         }
