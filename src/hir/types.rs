@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use rustc_hash::FxHashMap as HashMap;
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
 

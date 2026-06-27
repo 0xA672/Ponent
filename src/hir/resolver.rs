@@ -921,18 +921,15 @@ impl<'a> NameResolver<'a> {
                     if path.len() == 1 {
                         match path[0].as_str() {
                             "Int" => {
-                                let bits = self.extract_int_from_type(&args[0])
-                                    .unwrap_or(32);
+                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
                                 return self.ctx.int(bits, true);
                             }
                             "UInt" => {
-                                let bits = self.extract_int_from_type(&args[0])
-                                    .unwrap_or(32);
+                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
                                 return self.ctx.int(bits, false);
                             }
                             "Float" => {
-                                let bits = self.extract_int_from_type(&args[0])
-                                    .unwrap_or(64);
+                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(64);
                                 return self.ctx.float(bits);
                             }
                             _ => {}

@@ -577,3 +577,71 @@ impl fmt::Display for Span {
         write!(f, "{}..{}", self.start, self.end)
     }
 }
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::VariableDef { span, .. } => *span,
+            Stmt::FunctionDef { span, .. } => *span,
+            Stmt::TypeDef { span, .. } => *span,
+            Stmt::TraitDef { span, .. } => *span,
+            Stmt::Import { span, .. } => *span,
+            Stmt::ExternFunction { span, .. } => *span,
+            Stmt::Constraint { span, .. } => *span,
+            Stmt::Edition(_, span) => *span,
+            Stmt::Expression(expr) => expr.span(),
+            Stmt::If { span, .. } => *span,
+            Stmt::IfLet { span, .. } => *span,
+            Stmt::While { span, .. } => *span,
+            Stmt::WhileLet { span, .. } => *span,
+            Stmt::For { span, .. } => *span,
+            Stmt::Loop { span, .. } => *span,
+            Stmt::Leave { span, .. } => *span,
+            Stmt::Continue { span, .. } => *span,
+            Stmt::Return { span, .. } => *span,
+            Stmt::Assign { span, .. } => *span,
+            Stmt::ComptimeBlock { span, .. } => *span,
+            Stmt::ScopeCleanup { span, .. } => *span,
+            Stmt::Trigger { span, .. } => *span,
+            Stmt::Unsafe { span, .. } => *span,
+            Stmt::GhostVariableDef { span, .. } => *span,
+            Stmt::Isolate { span, .. } => *span,
+            Stmt::ImplBlock { span, .. } => *span,
+            Stmt::Error(span) => *span,
+        }
+    }
+}
+
+impl Expr {
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Literal(_, span) => *span,
+            Expr::Ident(_, span) => *span,
+            Expr::TypeAnnotated { span, .. } => *span,
+            Expr::BinaryOp { span, .. } => *span,
+            Expr::UnaryOp { span, .. } => *span,
+            Expr::Call { span, .. } => *span,
+            Expr::Index { span, .. } => *span,
+            Expr::FieldAccess { span, .. } => *span,
+            Expr::AttrAccess { span, .. } => *span,
+            Expr::Cast { span, .. } => *span,
+            Expr::Range { span, .. } => *span,
+            Expr::StructLit { span, .. } => *span,
+            Expr::EnumLit { span, .. } => *span,
+            Expr::Move(_, span) => *span,
+            Expr::Tuple(_, span) => *span,
+            Expr::Array(_, span) => *span,
+            Expr::Closure { span, .. } => *span,
+            Expr::Try { span, .. } => *span,
+            Expr::UnsafeBlock { span, .. } => *span,
+            Expr::Catch { span, .. } => *span,
+            Expr::LeaveWith { span, .. } => *span,
+            Expr::Await { span, .. } => *span,
+            Expr::If { span, .. } => *span,
+            Expr::IfLet { span, .. } => *span,
+            Expr::Match { span, .. } => *span,
+            Expr::Block(_, span) => *span,
+            Expr::Error(span) => *span,
+        }
+    }
+}

@@ -30,7 +30,9 @@ impl TraitEnv {
             .lookup_trait_by_def_id(candidate.trait_id)
             .map(|b| b.crate_id);
         let type_def_id = ctx.get_def_id_for_type(candidate.for_type);
-        let type_crate = type_def_id.and_then(|did| symbols.lookup_type_by_def_id(did)).map(|b| b.crate_id);
+        let type_crate = type_def_id
+            .and_then(|did| symbols.lookup_type_by_def_id(did))
+            .map(|b| b.crate_id);
 
         let local = symbols.local_crate_id;
 
