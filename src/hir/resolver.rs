@@ -868,6 +868,17 @@ impl<'a> NameResolver<'a> {
                     self.resolve_pattern(p);
                 }
             }
+            Pattern::Slice(before, slice, after, ..) => {
+                for p in before {
+                    self.resolve_pattern(p);
+                }
+                if let Some(slice) = slice {
+                    self.resolve_pattern(slice);
+                }
+                for p in after {
+                    self.resolve_pattern(p);
+                }
+            }
             Pattern::Error(..) => {}
         }
     }

@@ -346,6 +346,7 @@ pub enum HirPattern {
         span: Span,
     },
     Or(Vec<HirPattern>, Span),
+    Slice(Vec<HirPattern>, Option<Box<HirPattern>>, Vec<HirPattern>, Span),
     Error(Span),
 }
 

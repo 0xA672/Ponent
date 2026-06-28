@@ -1,6 +1,5 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
-use std::fmt;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,6 +149,10 @@ impl TypeContext {
     pub fn get(&self, id: TypeId) -> &TypeData {
         let resolved = self.resolve_binding(id);
         &self.types[resolved.0]
+    }
+
+    pub fn is_infer_var(&self, id: TypeId) -> bool {
+        matches!(self.get(id), TypeData::InferVar { .. })
     }
 
     pub(crate) fn resolve_binding(&self, id: TypeId) -> TypeId {
@@ -966,5 +969,4 @@ pub enum TypeError {
     },
 }
 
-use crate::ast::Expr;
-use crate::ast::Span;
+

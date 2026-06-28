@@ -59,7 +59,7 @@ fn main() {
                                     &mut ctx,
                                 );
 
-                                let mut checker = TypeChecker::new(&mut ctx, &symbols, &trait_env);
+                                let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env);
                                 match checker.check_program(&program) {
                                     Ok(_hir_program) => {
                                         println!("Type checking succeeded.");

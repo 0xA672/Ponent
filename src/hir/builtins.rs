@@ -1,7 +1,7 @@
-use crate::ast::Span;
-use crate::hir::symbol::{SymbolTable, TraitBinding};
+use crate::ast::{EnumVariant, Span, Type, TypeParam};
+use crate::hir::symbol::{SymbolTable, TraitBinding, TypeBinding, TypeKind};
 use crate::hir::traits::{ImplCandidate, TraitEnv};
-use crate::hir::types::{DefId, TypeContext, TypeId};
+use crate::hir::types::{DefId, TypeContext};
 
 fn insert_trait(symbols: &mut SymbolTable, name: &str, def_id: &mut DefId) {
     *def_id = symbols.allocate_def_id();
@@ -97,5 +97,109 @@ pub fn register_builtins(
                 false,
             )
             .ok();
+    }
+
+    // Register standard library types: Result, Option, Future
+
+    // Result<T, E>
+    {
+        let def_id = symbols.allocate_def_id();
+        let result_t = TypeParam {
+            name: "T".to_string(),
+            bounds: vec![],
+            span: Span::new(0, 0),
+        };
+        let result_e = TypeParam {
+            name: "E".to_string(),
+            bounds: vec![],
+            span: Span::new(0, 0),
+        };
+        let ok_variant = EnumVariant {
+            name: "Ok".to_string(),
+            payload: Some(Type::Path(vec!["T".to_string()], Span::new(0, 0))),
+            span: Span::new(0, 0),
+        };
+        let err_variant = EnumVariant {
+            name: "Err".to_string(),
+            payload: Some(Type::Path(vec!["E".to_string()], Span::new(0, 0))),
+            span: Span::new(0, 0),
+        };
+        let binding = TypeBinding {
+            def_id,
+            params: vec![result_t, result_e],
+            kind: TypeKind::Enum,
+            span: Span::new(0, 0),
+            alias_ast: None,
+            fields: vec![],
+            variants: vec![ok_variant, err_variant],
+            invariant: None,
+            default_value: None,
+            no_default: true,
+            crate_id: symbols.local_crate_id,
+        };
+        symbols.insert_type("Result".to_string(), binding, Span::new(0, 0)).ok();
+    }
+
+    // Option<T>
+    {
+        let def_id = symbols.allocate_def_id();
+        let option_t = TypeParam {
+            name: "T".to_string(),
+            bounds: vec![],
+            span: Span::new(0, 0),
+        };
+        let none_variant = EnumVariant {
+            name: "None".to_string(),
+            payload: None,
+            span: Span::new(0, 0),
+        };
+        let some_variant = EnumVariant {
+            name: "Some".to_string(),
+            payload: Some(Type::Path(vec!["T".to_string()], Span::new(0, 0))),
+            span: Span::new(0, 0),
+        };
+        let binding = TypeBinding {
+            def_id,
+            params: vec![option_t],
+            kind: TypeKind::Enum,
+            span: Span::new(0, 0),
+            alias_ast: None,
+            fields: vec![],
+            variants: vec![none_variant, some_variant],
+            invariant: None,
+            default_value: None,
+            no_default: true,
+            crate_id: symbols.local_crate_id,
+        };
+        symbols.insert_type("Option".to_string(), binding, Span::new(0, 0)).ok();
+    }
+
+    // Future<T>
+    {
+        let def_id = symbols.allocate_def_id();
+        let future_t = TypeParam {
+            name: "T".to_string(),
+            bounds: vec![],
+            span: Span::new(0, 0),
+        };
+        let output_variant = EnumVariant {
+            name: "Output".to_string(),
+            payload: Some(Type::Path(vec!["T".to_string()], Span::new(0, 0))),
+            span: Span::new(0, 0),
+        };
+        let binding = TypeBinding {
+            def_id,
+            params: vec![future_t],
+            kind: TypeKind::Enum,
+            span: Span::new(0, 0),
+            alias_ast: None,
+            fields: vec![],
+            variants: vec![output_variant],
+            invariant: None,
+            default_value: None,
+            no_default: true,
+            crate_id: symbols.local_crate_id,
+        };
+        symbols.insert_type("Future".to_string(), binding, Span::new(0, 0)).ok();
     }
 }

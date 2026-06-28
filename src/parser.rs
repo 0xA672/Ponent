@@ -2194,7 +2194,13 @@ impl<'source> Parser<'source> {
     fn parse_impl_block(&mut self, attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        let trait_path = if matches!(self.peek(), Ok(Token::Ident(_))) {
+        // Inherent impl: `impl TypeName { ... }`
+        // Trait impl:   `impl TraitName for TypeName { ... }`
+        // Check if the next token is `for` → inherent impl
+        let trait_path = if matches!(self.peek(), Ok(Token::For)) {
+            self.advance().ok(); // consume `for`
+            None
+        } else if matches!(self.peek(), Ok(Token::Ident(_))) {
             let mut path = Vec::new();
             path.push(match self.advance() {
                 Ok(Token::Ident(name)) => name,

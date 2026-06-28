@@ -533,6 +533,7 @@ pub enum Pattern {
         span: Span,
     },
     Or(Vec<Pattern>, Span),
+    Slice(Vec<Pattern>, Option<Box<Pattern>>, Vec<Pattern>, Span),
     Error(Span),
 }
 
@@ -575,6 +576,28 @@ pub struct Program {
 impl fmt::Display for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}..{}", self.start, self.end)
+    }
+}
+
+impl Type {
+    pub fn span(&self) -> Span {
+        match self {
+            Type::Path(_, span)
+            | Type::Reference(_, _, span)
+            | Type::Pointer(_, span)
+            | Type::Slice(_, span)
+            | Type::Array(_, _, span)
+            | Type::Tuple(_, span)
+            | Type::Function { span, .. }
+            | Type::Projection(_, _, span)
+            | Type::DynTrait(_, span)
+            | Type::Exists { span, .. }
+            | Type::Literal(_, span)
+            | Type::Never(span)
+            | Type::Union(_, span)
+            | Type::Error(span) => *span,
+            Type::Generic(_, _, span) => *span,
+        }
     }
 }
 

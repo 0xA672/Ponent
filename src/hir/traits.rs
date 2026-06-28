@@ -1,6 +1,7 @@
 use crate::ast::Span;
 use crate::hir::symbol::SymbolTable;
-use crate::hir::types::{CrateId, DefId, TypeId};
+use crate::hir::types::{DefId, TypeContext, TypeData, TypeId};
+use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ImplCandidate {
@@ -10,13 +11,24 @@ pub struct ImplCandidate {
     pub span: Span,
 }
 
+/// Describes a single method with resolved type IDs, ready for method lookup.
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    pub name: String,
+    pub param_tys: Vec<TypeId>,
+    pub ret_ty: TypeId,
+    pub span: Span,
+}
+
 pub struct TraitEnv {
     impls: Vec<ImplCandidate>,
+    /// Inherent (non-trait) methods indexed by the DefId of the type they're implemented on.
+    inherent_methods: HashMap<DefId, Vec<MethodInfo>>,
 }
 
 impl TraitEnv {
     pub fn new() -> Self {
-        TraitEnv { impls: Vec::new() }
+        TraitEnv { impls: Vec::new(), inherent_methods: HashMap::default() }
     }
 
     pub fn add_impl(
@@ -55,6 +67,30 @@ impl TraitEnv {
         self.impls
             .iter()
             .find(|cand| cand.trait_id == trait_id && cand.for_type == type_id)
+    }
+
+    /// Find all impl candidates whose `for_type` matches the given type exactly.
+    /// This is used for inherent method lookup (methods on a type without a trait).
+    pub fn lookup_impls_for_type(&self, type_id: TypeId) -> Vec<&ImplCandidate> {
+        self.impls
+            .iter()
+            .filter(|cand| cand.for_type == type_id)
+            .collect()
+    }
+
+    /// Register resolved inherent methods for a type.
+    pub fn add_inherent_methods(&mut self, for_type: DefId, methods: Vec<MethodInfo>) {
+        self.inherent_methods.entry(for_type).or_default().extend(methods);
+    }
+
+    /// Look up inherent methods registered for a type.
+    pub fn lookup_inherent_methods(&self, ty: TypeId, ctx: &TypeContext) -> &[MethodInfo] {
+        match ctx.get(ty) {
+            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
+                self.inherent_methods.get(def_id).map(|v| v.as_slice()).unwrap_or(&[])
+            }
+            _ => &[],
+        }
     }
 }
 

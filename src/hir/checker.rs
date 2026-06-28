@@ -5,25 +5,179 @@ use crate::hir::infer::*;
 use crate::hir::symbol::*;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::mem;
+
+/// Compute the Levenshtein distance between two strings.
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<_> = a.chars().collect();
+    let b_chars: Vec<_> = b.chars().collect();
+    let a_len = a_chars.len();
+    let b_len = b_chars.len();
+    // Use a single-row optimization for small strings
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr = vec![0; b_len + 1];
+    for i in 1..=a_len {
+        curr[0] = i;
+        for j in 1..=b_len {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            curr[j] = std::cmp::min(
+                std::cmp::min(curr[j - 1] + 1, prev[j] + 1),
+                prev[j - 1] + cost,
+            );
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_len]
+}
+
+/// Find names in `candidates` that are similar to `name` (edit distance ≤ 2),
+/// sorted by closest match. Returns up to 3 suggestions.
+fn find_similar_names<'a>(name: &str, candidates: &'a [String]) -> Vec<&'a str> {
+    let mut scored: Vec<(&str, usize)> = candidates
+        .iter()
+        .map(|c| (c.as_str(), levenshtein_distance(name, c)))
+        .filter(|(_, d)| *d <= 3 && *d > 0)
+        .collect();
+    scored.sort_by_key(|(_, d)| *d);
+    scored.truncate(3);
+    scored.into_iter().map(|(n, _)| n).collect()
+}
+
+/// Build a "did you mean ...?" suggestion string from similar names.
+fn did_you_mean_suggestion(name: &str, candidates: &[String]) -> Option<String> {
+    let similar = find_similar_names(name, candidates);
+    if similar.is_empty() {
+        None
+    } else {
+        Some(format!("did you mean `{}`?", similar.join("`, `")))
+    }
+}
+
+/// Check whether an expression is a valid assignment target (lvalue).
+fn is_valid_lvalue(expr: &Expr) -> bool {
+    match expr {
+        Expr::Ident(_, _) => true,
+        Expr::FieldAccess { .. } => true,
+        Expr::Index { .. } => true,
+        Expr::UnaryOp { op: UnaryOp::Deref, .. } => true,
+        Expr::UnaryOp { op: UnaryOp::Ref, expr, .. } | Expr::UnaryOp { op: UnaryOp::RefMut, expr, .. } => {
+            is_valid_lvalue(expr)
+        }
+        _ => false,
+    }
+}
+
+/// An iterator that walks the autoderef chain of a type.
+/// Each call to `next()` attempts to dereference the current type once
+/// using built-in deref rules. Stops after `max_depth` steps.
+struct AutoderefIter<'a> {
+    checker: &'a TypeChecker<'a>,
+    current: Option<TypeId>,
+    depth: usize,
+    max_depth: usize,
+}
+
+impl<'a> Iterator for AutoderefIter<'a> {
+    type Item = TypeId;
+
+    fn next(&mut self) -> Option<TypeId> {
+        let ty = self.current?;
+        if self.depth >= self.max_depth {
+            self.current = None;
+            return Some(ty);
+        }
+        self.depth += 1;
+        self.current = self.checker.builtin_deref_ty(ty);
+        Some(ty)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expectation {
+    None,
+    HasType(TypeId),
+    CastableToType(TypeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtxKind {
+    /// A normaw function body or top-wevel bwock (•́ω•̀)
+    Function,
+    /// A cwosuwe body (can't bweak/continue fwom outside) (/ω＼)
+    Closure,
+    /// An async bwock (wike a cwosuwe) ☆ﾟ.*･｡ﾟ
+    AsyncBlock,
+    /// A widdle woop (wike `woop { ... }`)
+    Loop,
+    /// A `whiwe` woop
+    While,
+    /// A `fow` woop
+    For,
+    /// A wabewed bwock (can be bweaked via `bweak 'wabew`) (｀・ω・´)
+    LabeledBlock,
+}
+
+/// A fwame howding the context kind and its span (*/ω＼*)
+struct CtxFrame {
+    kind: CtxKind,
+    span: Span,
+    /// Optionaw wabew name (onwy used by WabewedBwock)
+    label: Option<String>,
+}
 
 pub struct TypeChecker<'a> {
     ctx: &'a mut TypeContext,
     symbols: &'a SymbolTable,
-    trait_env: &'a TraitEnv,
+    trait_env: &'a mut TraitEnv,
     diagnostics: DiagnosticCollector,
     current_function: Option<DefId>,
     current_return_type: Option<TypeId>,
     resolving_aliases: HashSet<DefId>,
     infer: InferenceContext,
     infer_stack: Vec<InferenceContext>,
+    /// Context stack: twacks cuwwent function, woop, cwosuwe, etc. (｀・ω・´)
+    loop_stack: Vec<CtxFrame>,
+    /// Locaw cache of variabwe types, updated by check_stmt for each VawiabweDef.
+    /// Ovewwides the wesowvew's pwacehowdew `ewrow` type. (◕‿◕)
+    local_variable_types: HashMap<String, TypeId>,
+}
+
+struct ScopeGuard<'a, 'tcx> {
+    checker: &'tcx mut TypeChecker<'a>,
+    old_function: Option<DefId>,
+    old_return: Option<TypeId>,
+    should_restore: bool,
+}
+
+impl<'a, 'tcx> ScopeGuard<'a, 'tcx> {
+    fn new(checker: &'tcx mut TypeChecker<'a>) -> Self {
+        let old_function = checker.current_function;
+        let old_return = checker.current_return_type;
+        ScopeGuard { checker, old_function, old_return, should_restore: true }
+    }
+
+    fn defuse(mut self) {
+        self.should_restore = false;
+    }
+}
+
+impl<'a, 'tcx> Drop for ScopeGuard<'a, 'tcx> {
+    fn drop(&mut self) {
+        if self.should_restore {
+            self.checker.current_function = self.old_function;
+            self.checker.current_return_type = self.old_return;
+            self.checker.exit_inference_scope().ok();
+        }
+    }
 }
 
 impl<'a> TypeChecker<'a> {
     pub fn new(
         ctx: &'a mut TypeContext,
         symbols: &'a SymbolTable,
-        trait_env: &'a TraitEnv,
+        trait_env: &'a mut TraitEnv,
     ) -> Self {
         TypeChecker {
             ctx,
@@ -35,25 +189,99 @@ impl<'a> TypeChecker<'a> {
             resolving_aliases: HashSet::new(),
             infer: InferenceContext::new(),
             infer_stack: Vec::new(),
+            loop_stack: vec![CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None }],
+            local_variable_types: HashMap::new(),
         }
     }
 
     fn enter_inference_scope(&mut self) {
-        let old = std::mem::replace(&mut self.infer, InferenceContext::new());
+        let old = mem::replace(&mut self.infer, InferenceContext::new());
         self.infer_stack.push(old);
     }
 
     fn exit_inference_scope(&mut self) -> Result<(), DiagnosticCollector> {
-        let mut current =
-            std::mem::replace(&mut self.infer, self.infer_stack.pop().unwrap_or_default());
+        let mut current = mem::replace(&mut self.infer, self.infer_stack.pop().unwrap_or_default());
         if let Err(err) = current.solve(self.ctx, self.trait_env) {
             let diag = Diagnostic::error(format!("type inference error: {:?}", err))
                 .with_span(Span::new(0, 0));
             self.diagnostics.push(diag);
-            return Err(std::mem::take(&mut self.diagnostics));
+            return Err(mem::take(&mut self.diagnostics));
         }
         let _solution = current.finalize(self.ctx);
         Ok(())
+    }
+
+    fn push_ctx(&mut self, kind: CtxKind, span: Span, label: Option<String>) {
+        self.loop_stack.push(CtxFrame { kind, span, label });
+    }
+
+    fn pop_ctx(&mut self) {
+        self.loop_stack.pop();
+    }
+
+    /// Find the innermost bweak tawget (Woop, Whiwe, Fow, WabewedBwock) (*＾▽＾)／
+    /// Wetuwns the tawget's span and optionaw wabew. If `wabew` is Some, onwy match same-named WabewedBwock.
+    fn find_break_target<'b>(&self, label: Option<&'b str>) -> Option<(Span, Option<&'b str>)> {
+        for frame in self.loop_stack.iter().rev() {
+            match &frame.kind {
+                CtxKind::Loop | CtxKind::While | CtxKind::For => {
+                    if label.is_none() {
+                        return Some((frame.span, None));
+                    }
+                    // If wabewed, keep wooking up the stack fow a matching wabewed bwock
+                }
+                CtxKind::LabeledBlock => {
+                    if let Some(lbl) = label {
+                        if frame.label.as_deref() == Some(lbl) {
+                            return Some((frame.span, Some(lbl)));
+                        }
+                    }
+                }
+                // bweak cannot escape a cwosuwe or async bwock uwu
+                CtxKind::Closure | CtxKind::AsyncBlock => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Find the innermost continue tawget (onwy Woop, Whiwe, Fow) ☆ﾟ.*･｡ﾟ
+    fn find_continue_target<'b>(&self, label: Option<&'b str>) -> Option<(Span, &'b str)> {
+        for frame in self.loop_stack.iter().rev() {
+            match &frame.kind {
+                CtxKind::Loop | CtxKind::While | CtxKind::For => {
+                    if let Some(lbl) = label {
+                        // If wabewed, keep wooking up the stack (*´∀`*)
+                        continue;
+                    }
+                    let kind_str = match frame.kind {
+                        CtxKind::Loop => "woop",
+                        CtxKind::While => "whiwe",
+                        CtxKind::For => "fow",
+                        _ => unreachable!(),
+                    };
+                    return Some((frame.span, kind_str));
+                }
+                CtxKind::LabeledBlock => {
+                    if let Some(lbl) = label {
+                        if frame.label.as_deref() == Some(lbl) {
+                            // Found matching wabewed bwock — see if it contains a woop we can continue
+                            // WabewedBwock itsewf can't be continued, that's fow the cawwee to decide (/ω＼)
+                            continue;
+                        }
+                        // Doesn't match, keep wooking uwu
+                        continue;
+                    }
+                }
+                CtxKind::Closure | CtxKind::AsyncBlock => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     pub fn check_program(&mut self, program: &Program) -> Result<HirProgram, DiagnosticCollector> {
@@ -69,12 +297,9 @@ impl<'a> TypeChecker<'a> {
         }
 
         if self.diagnostics.has_errors() {
-            Err(std::mem::take(&mut self.diagnostics))
+            Err(mem::take(&mut self.diagnostics))
         } else {
-            Ok(HirProgram {
-                items,
-                span: program.span,
-            })
+            Ok(HirProgram { items, span: program.span })
         }
     }
 
@@ -91,22 +316,67 @@ impl<'a> TypeChecker<'a> {
                 span,
                 ..
             } => {
-                let ty_id = if let Some(ty) = ty {
+                // 'set' does not support pattern destructuring
+                if *kind == VariableKind::Set && pattern.is_some() {
+                    self.diagnostics.push(
+                        Diagnostic::error("`set` does not support pattern destructuring; use `let` instead")
+                            .with_code("E001")
+                            .with_span(*span),
+                    );
+                }
+
+                // 'let' must have an explicit initializer
+                if *kind == VariableKind::Let && value.is_none() {
+                    self.diagnostics.push(
+                        Diagnostic::error("`let` requires an explicit initializer; it cannot rely on a type's default value")
+                            .with_code("E002")
+                            .with_span(*span),
+                    );
+                }
+
+                // Resolve the declared type, or leave as an inference variable if not provided.
+                let declared_ty = if let Some(ty) = ty {
                     self.resolve_type(ty)?
                 } else {
                     self.new_infer_var(TypeVariableKind::Unconstrained)
                 };
 
-                let value_hir = if let Some(value) = value {
-                    let (hir, inferred_ty) = self.synthesize(value)?;
-                    self.unify(ty_id, inferred_ty, *span)?;
-                    Some(Box::new(hir))
+                // Determine the actual initializer (value) and its type.
+                let (value_hir, inferred_ty) = if let Some(value) = value {
+                    // Explicit initializer present
+                    if ty.is_some() {
+                        let hir = self.check_expr(value, Expectation::HasType(declared_ty))?;
+                        let ty = hir.ty();
+                        (Some(hir), ty)
+                    } else {
+                        let (hir, ty) = self.infer_expr(value)?;
+                        (Some(hir), ty)
+                    }
                 } else {
-                    None
+                    // No explicit initializer: try type's default value
+                    let default_expr = self.lookup_type_default_expr(declared_ty, *span)?;
+                    if let Some(default_expr) = default_expr {
+                        let hir = self.check_expr(&default_expr, Expectation::HasType(declared_ty))?;
+                        let ty = hir.ty();
+                        (Some(hir), ty)
+                    } else {
+                        // Neither default nor initializer – error
+                        self.diagnostics.push(
+                            Diagnostic::error("type has no default value and no initializer provided")
+                                .with_code("E003")
+                                .with_span(*span),
+                        );
+                        (None, declared_ty)
+                    }
                 };
 
+                // Unify declared type with inferred type (if we have both)
+                if let Some(ref value_hir) = value_hir {
+                    self.unify(declared_ty, inferred_ty, *span)?;
+                }
+
                 let pattern_hir = if let Some(pattern) = pattern {
-                    Some(self.check_pattern(pattern, ty_id)?)
+                    Some(self.check_pattern(pattern, declared_ty)?)
                 } else {
                     None
                 };
@@ -121,13 +391,18 @@ impl<'a> TypeChecker<'a> {
                     None
                 };
 
-                let final_ty = if ty_id != self.ctx.error() {
-                    ty_id
+                let final_ty = if declared_ty != self.ctx.error() {
+                    declared_ty
                 } else if let Some(hir) = &value_hir {
                     hir.ty()
                 } else {
                     self.ctx.error()
                 };
+
+                // Cache the variable's type for subsequent references
+                if let Some(var_name) = name {
+                    self.local_variable_types.insert(var_name.clone(), final_ty);
+                }
 
                 Ok(HirStmt::VariableDef {
                     kind: *kind,
@@ -135,25 +410,14 @@ impl<'a> TypeChecker<'a> {
                     name: name.clone(),
                     pattern: pattern_hir,
                     ty: final_ty,
-                    value: value_hir,
+                    value: value_hir.map(Box::new),
                     else_branch: else_hir,
                     span: *span,
                 })
             }
             Stmt::FunctionDef {
-                span,
-                attributes,
-                contracts,
-                name,
-                params,
-                return_type,
-                body,
-                type_params,
-                where_clause,
-                finally,
-                is_comptime,
-                is_async,
-                ..
+                span, attributes, contracts, name, params, return_type, body, type_params,
+                where_clause, finally, is_comptime, is_async, ..
             } => {
                 let return_ty = self.resolve_type(return_type)?;
                 let mut hir_params = Vec::new();
@@ -171,38 +435,33 @@ impl<'a> TypeChecker<'a> {
                     });
                 }
 
-                let old_function = self.current_function;
-                let old_return = self.current_return_type;
-                self.current_function = Some(DefId(0));
-                self.current_return_type = Some(return_ty);
+                let guard = ScopeGuard::new(self);
+                guard.checker.current_function = Some(DefId(0));
+                guard.checker.current_return_type = Some(return_ty);
+                guard.checker.enter_inference_scope();
+                guard.checker.push_ctx(CtxKind::Function, *span, None);
 
-                self.enter_inference_scope();
-
-                let body_check_result = (|| {
-                    if let Some(body) = body {
-                        let mut stmts = Vec::new();
-                        for s in body {
-                            stmts.push(self.check_stmt(s)?);
-                        }
-                        Ok(Some(stmts))
-                    } else {
-                        Ok(None)
+                let body_result = if let Some(body) = body {
+                    let mut stmts = Vec::new();
+                    for s in body {
+                        stmts.push(guard.checker.check_stmt(s)?);
                     }
-                })();
-
-                let exit_result = self.exit_inference_scope();
-                self.current_function = old_function;
-                self.current_return_type = old_return;
-
-                let body_hir = match body_check_result {
-                    Ok(body) => body,
-                    Err(e) => {
-                        exit_result.ok();
-                        return Err(e);
-                    }
+                    Ok(Some(stmts))
+                } else {
+                    Ok(None)
                 };
 
-                if let Err(err) = exit_result {
+                guard.checker.pop_ctx();
+
+                let body_hir = match body_result {
+                    Ok(body) => body,
+                    Err(e) => return Err(e),
+                };
+
+                let exit_res = guard.checker.exit_inference_scope();
+                guard.defuse();
+
+                if let Err(_err) = exit_res {
                     return Err(Diagnostic::error("inference failure").with_span(*span));
                 }
 
@@ -238,43 +497,24 @@ impl<'a> TypeChecker<'a> {
                 })
             }
             Stmt::Expression(expr) => {
-                let (hir, _) = self.synthesize(expr)?;
+                let (hir, _) = self.infer_expr(expr)?;
                 Ok(HirStmt::Expression(Box::new(hir)))
             }
-            Stmt::If {
-                cond,
-                then_branch,
-                else_branch,
-                span,
-            } => {
-                let (cond_hir, cond_ty) = self.synthesize(cond)?;
+            Stmt::If { cond, then_branch, else_branch, span } => {
+                let (cond_hir, cond_ty) = self.infer_expr(cond)?;
                 if !self.ctx.is_bool(cond_ty) {
-                    self.diagnostics
-                        .push(Diagnostic::error("if condition must be boolean").with_span(*span));
+                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span));
                 }
-
                 let then_hir = self.check_block(then_branch)?;
                 let else_hir = if let Some(else_branch) = else_branch {
                     Some(self.check_block(else_branch)?)
                 } else {
                     None
                 };
-
-                Ok(HirStmt::If {
-                    cond: Box::new(cond_hir),
-                    then_branch: then_hir,
-                    else_branch: else_hir,
-                    span: *span,
-                })
+                Ok(HirStmt::If { cond: Box::new(cond_hir), then_branch: then_hir, else_branch: else_hir, span: *span })
             }
-            Stmt::IfLet {
-                pattern,
-                scrutinee,
-                then_branch,
-                else_branch,
-                span,
-            } => {
-                let (scrut_hir, scrut_ty) = self.synthesize(scrutinee)?;
+            Stmt::IfLet { pattern, scrutinee, then_branch, else_branch, span } => {
+                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
                 let pattern_hir = self.check_pattern(pattern, scrut_ty)?;
                 let then_hir = self.check_block(then_branch)?;
                 let else_hir = if let Some(else_branch) = else_branch {
@@ -282,254 +522,262 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     None
                 };
-
-                Ok(HirStmt::IfLet {
-                    pattern: pattern_hir,
-                    scrutinee: Box::new(scrut_hir),
-                    then_branch: then_hir,
-                    else_branch: else_hir,
-                    span: *span,
-                })
+                Ok(HirStmt::IfLet { pattern: pattern_hir, scrutinee: Box::new(scrut_hir), then_branch: then_hir, else_branch: else_hir, span: *span })
             }
-            Stmt::While {
-                cond,
-                body,
-                invariant,
-                decreases,
-                span,
-            } => {
-                let (cond_hir, cond_ty) = self.synthesize(cond)?;
+            Stmt::While { cond, body, invariant, decreases, span } => {
+                let (cond_hir, cond_ty) = self.infer_expr(cond)?;
                 if !self.ctx.is_bool(cond_ty) {
-                    self.diagnostics.push(
-                        Diagnostic::error("while condition must be boolean").with_span(*span),
-                    );
+                    self.diagnostics.push(Diagnostic::error("while condition must be boolean").with_span(*span));
                 }
-
-                let inv_hir = if let Some(inv) = invariant {
-                    Some(self.synthesize(inv)?.0)
-                } else {
-                    None
-                };
-
-                let dec_hir = if let Some(dec) = decreases {
-                    Some(self.synthesize(dec)?.0)
-                } else {
-                    None
-                };
-
+                let inv_hir = invariant.as_ref().map(|inv| self.infer_expr(inv).map(|(h, _)| h)).transpose()?;
+                let dec_hir = decreases.as_ref().map(|dec| self.infer_expr(dec).map(|(h, _)| h)).transpose()?;
+                self.push_ctx(CtxKind::While, *span, None);
                 let body_hir = self.check_block(body)?;
-
-                Ok(HirStmt::While {
-                    cond: Box::new(cond_hir),
-                    body: body_hir,
-                    invariant: inv_hir.map(Box::new),
-                    decreases: dec_hir.map(Box::new),
-                    span: *span,
-                })
+                self.pop_ctx();
+                Ok(HirStmt::While { cond: Box::new(cond_hir), body: body_hir, invariant: inv_hir.map(Box::new), decreases: dec_hir.map(Box::new), span: *span })
             }
-            Stmt::WhileLet {
-                pattern,
-                scrutinee,
-                body,
-                invariant,
-                decreases,
-                span,
-            } => {
-                let (scrut_hir, scrut_ty) = self.synthesize(scrutinee)?;
+            Stmt::WhileLet { pattern, scrutinee, body, invariant, decreases, span } => {
+                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
                 let pattern_hir = self.check_pattern(pattern, scrut_ty)?;
-
-                let inv_hir = if let Some(inv) = invariant {
-                    Some(self.synthesize(inv)?.0)
-                } else {
-                    None
-                };
-
-                let dec_hir = if let Some(dec) = decreases {
-                    Some(self.synthesize(dec)?.0)
-                } else {
-                    None
-                };
-
+                let inv_hir = invariant.as_ref().map(|inv| self.infer_expr(inv).map(|(h, _)| h)).transpose()?;
+                let dec_hir = decreases.as_ref().map(|dec| self.infer_expr(dec).map(|(h, _)| h)).transpose()?;
                 let body_hir = self.check_block(body)?;
-
-                Ok(HirStmt::WhileLet {
-                    pattern: pattern_hir,
-                    scrutinee: Box::new(scrut_hir),
-                    body: body_hir,
-                    invariant: inv_hir.map(Box::new),
-                    decreases: dec_hir.map(Box::new),
-                    span: *span,
-                })
+                Ok(HirStmt::WhileLet { pattern: pattern_hir, scrutinee: Box::new(scrut_hir), body: body_hir, invariant: inv_hir.map(Box::new), decreases: dec_hir.map(Box::new), span: *span })
             }
-            Stmt::For {
-                pattern,
-                iterable,
-                body,
-                invariant,
-                decreases,
-                span,
-            } => {
-                let (iter_hir, iter_ty) = self.synthesize(iterable)?;
-                let elem_ty = if let Some(slice_ty) = self.ctx.elem_of_slice(iter_ty) {
-                    slice_ty
-                } else if let Some(arr_ty) = self.ctx.elem_of_array(iter_ty) {
-                    arr_ty
-                } else {
-                    self.diagnostics.push(
-                        Diagnostic::error("for loop iterable must be an array or slice")
-                            .with_span(*span),
-                    );
-                    self.ctx.error()
-                };
-
+            Stmt::For { pattern, iterable, body, invariant, decreases, span } => {
+                let (iter_hir, iter_ty) = self.infer_expr(iterable)?;
+                let elem_ty = self.ctx.elem_of_slice(iter_ty)
+                    .or_else(|| self.ctx.elem_of_array(iter_ty))
+                    .unwrap_or_else(|| {
+                        self.diagnostics.push(Diagnostic::error("for loop iterable must be an array or slice").with_span(*span));
+                        self.ctx.error()
+                    });
                 let pattern_hir = self.check_pattern(pattern, elem_ty)?;
-
-                let inv_hir = if let Some(inv) = invariant {
-                    Some(self.synthesize(inv)?.0)
-                } else {
-                    None
-                };
-
-                let dec_hir = if let Some(dec) = decreases {
-                    Some(self.synthesize(dec)?.0)
-                } else {
-                    None
-                };
-
+                let inv_hir = invariant.as_ref().map(|inv| self.infer_expr(inv).map(|(h, _)| h)).transpose()?;
+                let dec_hir = decreases.as_ref().map(|dec| self.infer_expr(dec).map(|(h, _)| h)).transpose()?;
+                self.push_ctx(CtxKind::For, *span, None);
                 let body_hir = self.check_block(body)?;
-
-                Ok(HirStmt::For {
-                    pattern: pattern_hir,
-                    iterable: Box::new(iter_hir),
-                    body: body_hir,
-                    invariant: inv_hir.map(Box::new),
-                    decreases: dec_hir.map(Box::new),
-                    span: *span,
-                })
+                self.pop_ctx();
+                Ok(HirStmt::For { pattern: pattern_hir, iterable: Box::new(iter_hir), body: body_hir, invariant: inv_hir.map(Box::new), decreases: dec_hir.map(Box::new), span: *span })
             }
             Stmt::Loop { body, span } => {
+                self.push_ctx(CtxKind::Loop, *span, None);
                 let body_hir = self.check_block(body)?;
-                Ok(HirStmt::Loop {
-                    body: body_hir,
-                    span: *span,
-                })
+                self.pop_ctx();
+                Ok(HirStmt::Loop { body: body_hir, span: *span })
             }
-            Stmt::Leave { label, span } => Ok(HirStmt::Leave {
-                label: label.clone(),
-                span: *span,
-            }),
-            Stmt::Continue { label, span } => Ok(HirStmt::Continue {
-                label: label.clone(),
-                span: *span,
-            }),
-            Stmt::Return { value, span } => {
-                if let Some(value) = value {
-                    let (hir, ty) = self.synthesize(value)?;
-                    if let Some(ret_ty) = self.current_return_type {
-                        self.unify(ret_ty, ty, *span)?;
+            Stmt::Leave { label, span } => {
+                let target = self.find_break_target(label.as_deref());
+                match target {
+                    None => {
+                        // Check if we're inside a cwosuwe (>_<)
+                        let enclosing_closure = self.loop_stack.iter().rev()
+                            .find_map(|f| match f.kind {
+                                CtxKind::Closure | CtxKind::AsyncBlock => Some(f.span),
+                                _ => None,
+                            });
+                        if enclosing_closure.is_some() {
+                            self.diagnostics.push(
+                                Diagnostic::error("cannot `leave` out of a closure or async block")
+                                    .with_code("E005")
+                                    .with_span(*span)
+                            );
+                        } else if label.is_some() {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!("cannot `leave` with label `{}` – no matching labeled block or loop found", label.as_ref().unwrap()))
+                                    .with_code("E005")
+                                    .with_span(*span)
+                            );
+                        } else {
+                            self.diagnostics.push(
+                                Diagnostic::error("`leave` statement outside of loop; use `return` instead")
+                                    .with_code("E005")
+                                    .with_span(*span)
+                                    .with_suggestion("use `return` to exit the current function")
+                            );
+                        }
+                        Ok(HirStmt::Leave { label: label.clone(), span: *span })
                     }
-                    Ok(HirStmt::Return {
-                        value: Some(Box::new(hir)),
-                        span: *span,
-                    })
+                    Some(_) => {
+                        Ok(HirStmt::Leave { label: label.clone(), span: *span })
+                    }
+                }
+            }
+            Stmt::Continue { label, span } => {
+                let target = self.find_continue_target(label.as_deref());
+                match target {
+                    None => {
+                        let enclosing_closure = self.loop_stack.iter().rev()
+                            .find_map(|f| match f.kind {
+                                CtxKind::Closure | CtxKind::AsyncBlock => Some(f.span),
+                                _ => None,
+                            });
+                        if enclosing_closure.is_some() {
+                            self.diagnostics.push(
+                                Diagnostic::error("cannot `continue` out of a closure or async block")
+                                    .with_code("E006")
+                                    .with_span(*span)
+                            );
+                        } else {
+                            self.diagnostics.push(
+                                Diagnostic::error("`continue` statement outside of loop")
+                                    .with_code("E006")
+                                    .with_span(*span)
+                                    .with_suggestion("use `leave` or `return` instead")
+                            );
+                        }
+                        Ok(HirStmt::Continue { label: label.clone(), span: *span })
+                    }
+                    Some(_) => {
+                        Ok(HirStmt::Continue { label: label.clone(), span: *span })
+                    }
+                }
+            }
+            Stmt::Return { value, span } => {
+                // Check that return is inside a function or closure context
+                let in_function = self.loop_stack.iter().rev()
+                    .any(|f| matches!(f.kind, CtxKind::Function | CtxKind::Closure));
+                if !in_function {
+                    self.diagnostics.push(
+                        Diagnostic::error("`return` statement outside of function")
+                            .with_code("E007")
+                            .with_span(*span)
+                    );
+                }
+                if let Some(value) = value {
+                    if let Some(ret_ty) = self.current_return_type {
+                        let hir = self.check_expr(value, Expectation::HasType(ret_ty))?;
+                        Ok(HirStmt::Return { value: Some(Box::new(hir)), span: *span })
+                    } else {
+                        let (hir, _) = self.infer_expr(value)?;
+                        Ok(HirStmt::Return { value: Some(Box::new(hir)), span: *span })
+                    }
                 } else {
                     if let Some(ret_ty) = self.current_return_type {
                         if !self.ctx.is_unit(ret_ty) && !self.ctx.is_never(ret_ty) {
-                            self.diagnostics.push(
-                                Diagnostic::error("return without value in non-unit function")
-                                    .with_span(*span),
-                            );
+                            self.diagnostics.push(Diagnostic::error("return without value in non-unit function").with_span(*span));
                         }
                     }
-                    Ok(HirStmt::Return {
-                        value: None,
-                        span: *span,
-                    })
+                    Ok(HirStmt::Return { value: None, span: *span })
                 }
             }
-            Stmt::Assign {
-                target,
-                op,
-                value,
-                span,
-            } => {
-                let (target_hir, target_ty) = self.synthesize(target)?;
-                let (value_hir, value_ty) = self.synthesize(value)?;
-
-                if let Some(op) = op {
-                    let result_ty = self.binary_op_type(*op, target_ty, value_ty, *span)?;
-                    self.unify(target_ty, result_ty, *span)?;
-                } else {
-                    self.unify(target_ty, value_ty, *span)?;
+            Stmt::Assign { target, op, value, span } => {
+                // Validate that the target is a valid lvalue
+                if !is_valid_lvalue(target) {
+                    self.diagnostics.push(
+                        Diagnostic::error("invalid left-hand side for assignment; expected variable, field access, or index")
+                            .with_span(*span)
+                    );
                 }
-
-                Ok(HirStmt::Assign {
-                    target: Box::new(target_hir),
-                    op: *op,
-                    value: Box::new(value_hir),
-                    span: *span,
-                })
+                let (target_hir, target_ty) = self.infer_expr(target)?;
+                let value_hir = if let Some(op) = op {
+                    let result_ty = self.binary_op_type(*op, target_ty, target_ty, *span)?;
+                    self.unify(target_ty, result_ty, *span)?;
+                    self.check_expr(value, Expectation::HasType(target_ty))?
+                } else {
+                    self.check_expr(value, Expectation::HasType(target_ty))?
+                };
+                Ok(HirStmt::Assign { target: Box::new(target_hir), op: *op, value: Box::new(value_hir), span: *span })
             }
             Stmt::ComptimeBlock { body, span } => {
                 let body_hir = self.check_block(body)?;
-                Ok(HirStmt::ComptimeBlock {
-                    body: body_hir,
-                    span: *span,
-                })
+                Ok(HirStmt::ComptimeBlock { body: body_hir, span: *span })
             }
-            Stmt::ScopeCleanup {
-                name,
-                body,
-                propagates,
-                overrides,
-                span,
-            } => {
+            Stmt::ScopeCleanup { name, body, propagates, overrides, span } => {
                 let body_hir = self.check_block(body)?;
-                Ok(HirStmt::ScopeCleanup {
-                    name: name.clone(),
-                    body: body_hir,
-                    propagates: *propagates,
-                    overrides: *overrides,
-                    span: *span,
-                })
+                Ok(HirStmt::ScopeCleanup { name: name.clone(), body: body_hir, propagates: *propagates, overrides: *overrides, span: *span })
             }
-            Stmt::Trigger { name, span } => Ok(HirStmt::Trigger {
-                name: name.clone(),
-                span: *span,
-            }),
+            Stmt::Trigger { name, span } => Ok(HirStmt::Trigger { name: name.clone(), span: *span }),
             Stmt::Unsafe { body, span } => {
                 let body_hir = self.check_block(body)?;
-                Ok(HirStmt::Unsafe {
-                    body: body_hir,
-                    span: *span,
-                })
+                Ok(HirStmt::Unsafe { body: body_hir, span: *span })
             }
             Stmt::GhostVariableDef { inner, span } => {
                 let inner_hir = self.check_stmt(inner)?;
-                Ok(HirStmt::GhostVariableDef {
-                    inner: Box::new(inner_hir),
-                    span: *span,
-                })
+                Ok(HirStmt::GhostVariableDef { inner: Box::new(inner_hir), span: *span })
             }
             Stmt::Isolate { body, span } => {
                 let body_hir = self.check_block(body)?;
-                Ok(HirStmt::Isolate {
-                    body: body_hir,
-                    span: *span,
-                })
+                Ok(HirStmt::Isolate { body: body_hir, span: *span })
             }
-            Stmt::TypeDef { .. }
-            | Stmt::TraitDef { .. }
-            | Stmt::Import { .. }
-            | Stmt::ExternFunction { .. }
-            | Stmt::Constraint { .. }
-            | Stmt::Edition(..)
-            | Stmt::ImplBlock { .. } => {
-                self.diagnostics.push(
-                    Diagnostic::error("top-level item not yet supported in type checker")
-                        .with_span(stmt.span()),
-                );
+            Stmt::TypeDef { .. } => {
+                // Type definitions are already handled by the resolver;
+                // no additional checking needed here.
                 Ok(HirStmt::Error)
+            }
+            Stmt::TraitDef { .. } | Stmt::Import { .. }
+            | Stmt::ExternFunction { .. } | Stmt::Constraint { .. } | Stmt::Edition(..) => {
+                self.diagnostics.push(Diagnostic::error("top-level item not yet supported in type checker").with_span(stmt.span()));
+                Ok(HirStmt::Error)
+            }
+            Stmt::ImplBlock { .. } => {
+                let (trait_path, for_type, methods, span, attributes) = match stmt {
+                    Stmt::ImplBlock { span, trait_path, for_type, methods, attributes } => {
+                        (trait_path, for_type, methods, *span, attributes)
+                    }
+                    _ => unreachable!(),
+                };
+                if trait_path.is_some() {
+                    // Trait impl blocks are not yet supported — defer for later
+                    self.diagnostics.push(Diagnostic::error("trait impl blocks not yet supported in type checker").with_span(span));
+                    Ok(HirStmt::Error)
+                } else {
+                    // Inherent impl block: resolve the type and register methods
+                    let for_ty = self.resolve_type(for_type)?;
+                    let for_def_id = match self.ctx.get(for_ty) {
+                        TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => *def_id,
+                        _ => {
+                            self.diagnostics.push(Diagnostic::error("inherent impl on non-struct/enum type").with_span(span));
+                            return Ok(HirStmt::Error);
+                        }
+                    };
+                    // Resolve method param/return types, replacing `Self` with for_type
+                    fn resolve_self_ty(ty: &Type, self_ty: &Type) -> Type {
+                        match ty {
+                            Type::Path(p, s) if p.len() == 1 && (p[0] == "Self" || p[0] == "self") => self_ty.clone(),
+                            Type::Reference(inner, mutable, s) => Type::Reference(
+                                Box::new(resolve_self_ty(inner, self_ty)),
+                                *mutable,
+                                *s,
+                            ),
+                            Type::Pointer(inner, s) => Type::Pointer(
+                                Box::new(resolve_self_ty(inner, self_ty)),
+                                *s,
+                            ),
+                            other => other.clone(),
+                        }
+                    }
+                    let self_ty = &for_type; // The original AST type for Self
+                    let mut method_infos = Vec::new();
+                    for m in methods {
+                        let param_tys = m.params.iter()
+                            .map(|p| {
+                                if let Some(ty) = &p.ty {
+                                    let resolved = resolve_self_ty(ty, self_ty);
+                                    self.resolve_type(&resolved)
+                                } else { Ok(self.ctx.error()) }
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let ret_ty = {
+                            let resolved = resolve_self_ty(&m.return_type, self_ty);
+                            self.resolve_type(&resolved)?
+                        };
+                        method_infos.push(crate::hir::traits::MethodInfo {
+                            name: m.name.clone(),
+                            param_tys,
+                            ret_ty,
+                            span: m.span,
+                        });
+                    }
+                    self.trait_env.add_inherent_methods(for_def_id, method_infos);
+                    Ok(HirStmt::ImplBlock {
+                        span,
+                        attributes: attributes.clone(),
+                        trait_path: trait_path.clone(),
+                        for_type: for_ty,
+                        methods: methods.clone(),
+                    })
+                }
             }
             Stmt::Error(span) => Err(Diagnostic::error("invalid statement").with_span(*span)),
         }
@@ -543,545 +791,249 @@ impl<'a> TypeChecker<'a> {
         Ok(result)
     }
 
-    fn check_pattern(
-        &mut self,
-        pattern: &Pattern,
-        expected_ty: TypeId,
-    ) -> Result<HirPattern, Diagnostic> {
-        let expected_is_infer = matches!(self.ctx.get(expected_ty), TypeData::InferVar { .. });
-
-        match pattern {
-            Pattern::Wildcard(span) => Ok(HirPattern::Wildcard(*span)),
-            Pattern::Ident(name, span) => Ok(HirPattern::Ident(name.clone(), expected_ty, *span)),
-            Pattern::Literal(expr, span) => {
-                let (hir, ty) = self.synthesize(expr)?;
-                self.unify(expected_ty, ty, *span)?;
-                Ok(HirPattern::Literal(Box::new(hir), *span))
-            }
-            Pattern::Tuple(patterns, span) => {
-                if expected_is_infer {
-                    return Err(
-                        Diagnostic::error("cannot infer type for tuple pattern").with_span(*span)
-                    );
-                }
-                let expected_elems = if let Some(elems) = self.ctx.tuple_elems(expected_ty) {
-                    elems.to_vec()
-                } else if self.ctx.is_error(expected_ty) {
-                    vec![self.ctx.error(); patterns.len()]
-                } else {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "expected tuple type, found {:?}",
-                            self.ctx.get(expected_ty)
-                        ))
-                        .with_span(*span),
-                    );
-                    vec![self.ctx.error(); patterns.len()]
-                };
-
-                let mut hir_patterns = Vec::new();
-                for (i, pat) in patterns.iter().enumerate() {
-                    let elem_ty = if i < expected_elems.len() {
-                        expected_elems[i]
-                    } else {
-                        self.ctx.error()
-                    };
-                    hir_patterns.push(self.check_pattern(pat, elem_ty)?);
-                }
-                Ok(HirPattern::Tuple(hir_patterns, *span))
-            }
-            Pattern::Struct { path, fields, span } => {
-                if expected_is_infer {
-                    return Err(
-                        Diagnostic::error("cannot infer type for struct pattern").with_span(*span)
-                    );
-                }
-                let (def_id, args) = self.resolve_type_to_struct_or_enum(expected_ty, *span)?;
-                if let Ok(pattern_def_id) = self.resolve_def_id(path) {
-                    if pattern_def_id != def_id {
-                        self.diagnostics.push(
-                            Diagnostic::error(format!("pattern path does not match expected type"))
-                                .with_span(*span),
-                        );
-                    }
-                }
-                let binding = self
-                    .symbols
-                    .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
-                if !matches!(binding.kind, TypeKind::Struct) {
-                    return Err(Diagnostic::error("pattern type is not a struct").with_span(*span));
-                }
-                let mut subst = Subst::new();
-                for (i, param) in binding.params.iter().enumerate() {
-                    if let Some(&arg) = args.get(i) {
-                        subst.insert(i, arg);
-                    }
-                }
-                let mut hir_fields = Vec::new();
-                for (name, pat) in fields {
-                    let field_ty = binding
-                        .fields
-                        .iter()
-                        .find(|f| f.name == *name)
-                        .map(|f| self.ctx.subst(f.ty, &subst))
-                        .ok_or_else(|| {
-                            Diagnostic::error(format!("field '{}' not found", name))
-                                .with_span(*span)
-                        })?;
-                    let hir_pat = self.check_pattern(pat, field_ty)?;
-                    hir_fields.push((name.clone(), Box::new(hir_pat)));
-                }
-                Ok(HirPattern::Struct {
-                    path: path.clone(),
-                    fields: hir_fields,
-                    span: *span,
-                })
-            }
-            Pattern::Enum {
-                path,
-                variant,
-                inner,
-                span,
-            } => {
-                if expected_is_infer {
-                    return Err(
-                        Diagnostic::error("cannot infer type for enum pattern").with_span(*span)
-                    );
-                }
-                let (def_id, args) = self.resolve_type_to_struct_or_enum(expected_ty, *span)?;
-                if let Ok(pattern_def_id) = self.resolve_def_id(path) {
-                    if pattern_def_id != def_id {
-                        self.diagnostics.push(
-                            Diagnostic::error(format!("pattern path does not match expected type"))
-                                .with_span(*span),
-                        );
-                    }
-                }
-                let binding = self
-                    .symbols
-                    .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
-                if !matches!(binding.kind, TypeKind::Enum) {
-                    return Err(Diagnostic::error("pattern type is not an enum").with_span(*span));
-                }
-                let mut subst = Subst::new();
-                for (i, param) in binding.params.iter().enumerate() {
-                    if let Some(&arg) = args.get(i) {
-                        subst.insert(i, arg);
-                    }
-                }
-                let variant_def = binding
-                    .variants
-                    .iter()
-                    .find(|v| v.name == *variant)
-                    .ok_or_else(|| {
-                        Diagnostic::error(format!("variant '{}' not found", variant))
-                            .with_span(*span)
-                    })?;
-                let inner_ty = match &variant_def.payload {
-                    Some(payload_ty) => self.resolve_type(payload_ty)?,
-                    None => self.ctx.error(),
-                };
-                let inner_hir = if let Some(inner) = inner {
-                    Some(Box::new(self.check_pattern(inner, inner_ty)?))
-                } else {
-                    None
-                };
-                Ok(HirPattern::Enum {
-                    path: path.clone(),
-                    variant: variant.clone(),
-                    inner: inner_hir,
-                    span: *span,
-                })
-            }
-            Pattern::Or(patterns, span) => {
-                let mut hir_patterns = Vec::new();
-                for pat in patterns {
-                    hir_patterns.push(self.check_pattern(pat, expected_ty)?);
-                }
-                Ok(HirPattern::Or(hir_patterns, *span))
-            }
-            Pattern::Error(span) => Ok(HirPattern::Error(*span)),
-        }
-    }
-
-    fn synthesize(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
+    fn infer_expr(&mut self, expr: &Expr) -> Result<(HirExpr, TypeId), Diagnostic> {
         match expr {
             Expr::Literal(lit, span) => {
                 let kind = match lit {
                     Literal::Int(_) => TypeVariableKind::Integer,
                     Literal::Float(_) => TypeVariableKind::Float,
                     Literal::Bool(_) => TypeVariableKind::Bool,
-                    Literal::Char(_) => TypeVariableKind::Any,
-                    Literal::String(_) | Literal::ByteString(_) => TypeVariableKind::Any,
+                    Literal::Char(_) | Literal::String(_) | Literal::ByteString(_) => TypeVariableKind::Any,
                 };
                 let ty = self.new_infer_var(kind);
                 Ok((HirExpr::Literal(lit.clone(), ty, *span), ty))
             }
             Expr::Ident(name, span) => {
-                if let Some(binding) = self.symbols.lookup_variable(name, *span) {
+                // Check the local variable type cache first (set by VariableDef)
+                if let Some(&ty) = self.local_variable_types.get(name) {
+                    Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
+                } else if let Some(binding) = self.symbols.lookup_variable(name, *span) {
                     Ok((HirExpr::Ident(name.clone(), binding.ty, *span), binding.ty))
                 } else if let Some(func) = self.symbols.lookup_function(name) {
-                    let sig = func.signature.clone();
-                    let ty = self
-                        .ctx
-                        .function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
+                    let sig = &func.signature;
+                    let ty = self.ctx.function(sig.params.iter().map(|p| p.ty).collect(), sig.return_type);
                     Ok((HirExpr::Ident(name.clone(), ty, *span), ty))
                 } else {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!("undefined name: {}", name)).with_span(*span),
-                    );
+                    self.diagnostics.push(Diagnostic::error(format!("undefined name: {}", name)).with_span(*span));
                     Ok((HirExpr::Error(*span), self.ctx.error()))
                 }
             }
             Expr::TypeAnnotated { expr, ty, span } => {
-                let expected_ty = self.resolve_type(ty)?;
-                let (hir, actual_ty) = self.synthesize(expr)?;
-                self.unify(expected_ty, actual_ty, *span)?;
-                Ok((
-                    HirExpr::TypeAnnotated {
-                        expr: Box::new(hir),
-                        ty: expected_ty,
-                        span: *span,
-                    },
-                    expected_ty,
-                ))
+                let expected = self.resolve_type(ty)?;
+                let hir = self.check_expr(expr, Expectation::HasType(expected))?;
+                Ok((HirExpr::TypeAnnotated { expr: Box::new(hir), ty: expected, span: *span }, expected))
             }
-            Expr::BinaryOp {
-                left,
-                op,
-                right,
-                span,
-            } => {
-                let trait_id = self.get_trait_id_for_binop(*op, *span)?;
+            Expr::BinaryOp { left, op, right, span } => {
                 let result_ty = match op {
-                    BinOp::Eq
-                    | BinOp::Neq
-                    | BinOp::Lt
-                    | BinOp::Gt
-                    | BinOp::Le
-                    | BinOp::Ge
-                    | BinOp::And
-                    | BinOp::Or => self.ctx.bool(),
+                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                    | BinOp::And | BinOp::Or => self.ctx.bool(),
                     _ => self.new_infer_var(TypeVariableKind::Numeric),
                 };
-
-                let (left_hir, left_ty) = self.synthesize(left)?;
-                let (right_hir, right_ty) = self.synthesize(right)?;
-
+                let (left_hir, left_ty) = self.infer_expr(left)?;
+                let (right_hir, right_ty) = self.infer_expr(right)?;
                 self.unify(left_ty, right_ty, *span)?;
-                if let Some(trait_id) = trait_id {
+                if let Ok(Some(trait_id)) = self.get_trait_id_for_binop(*op, *span) {
                     self.add_constraint(Constraint::Impl(left_ty, trait_id, *span));
                     self.add_constraint(Constraint::Impl(right_ty, trait_id, *span));
                 }
-                match op {
-                    BinOp::Eq
-                    | BinOp::Neq
-                    | BinOp::Lt
-                    | BinOp::Gt
-                    | BinOp::Le
-                    | BinOp::Ge
-                    | BinOp::And
-                    | BinOp::Or => {}
-                    _ => {
-                        self.add_constraint(Constraint::Eq(result_ty, left_ty, *span));
+                if !matches!(op, BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::And | BinOp::Or) {
+                    self.add_constraint(Constraint::Eq(result_ty, left_ty, *span));
+                }
+                Ok((HirExpr::BinaryOp { left: Box::new(left_hir), op: *op, right: Box::new(right_hir), ty: result_ty, span: *span }, result_ty))
+            }
+            Expr::UnaryOp { op, expr, span } => {
+                let (hir, ty) = self.infer_expr(expr)?;
+                let result_ty = match op {
+                    UnaryOp::Neg | UnaryOp::BitNot => ty,
+                    UnaryOp::Not => self.ctx.bool(),
+                    UnaryOp::Deref => {
+                        self.ctx.pointee_of_ref(ty).or_else(|| self.ctx.pointee_of_pointer(ty)).unwrap_or(self.ctx.error())
+                    }
+                    UnaryOp::Ref | UnaryOp::RefMut => {
+                        let mutable = matches!(op, UnaryOp::RefMut);
+                        self.ctx.reference(ty, mutable)
+                    }
+                };
+                Ok((HirExpr::UnaryOp { op: *op, expr: Box::new(hir), ty: result_ty, span: *span }, result_ty))
+            }
+            Expr::Call { callee, args, comptime, span } => {
+                // Check if this is a method call (x.foo()) rather than a free function call
+                if let Expr::FieldAccess { base, field, .. } = callee.as_ref() {
+                    let (base_hir, base_ty) = self.infer_expr(base)?;
+                    if let Some((param_tys, ret_ty)) = self.lookup_method(base_ty, field) {
+                        // Adjust: method calls pass `self` as the first arg implicitly,
+                        // so the param list from the declaration includes self.
+                        // We treat `base` as the receiver and check remaining args.
+                        let explicit_param_tys = if param_tys.len() > 1 {
+                            &param_tys[1..] // skip self
+                        } else {
+                            &[] // no explicit params besides self
+                        };
+                        if explicit_param_tys.len() != args.len() {
+                            self.diagnostics.push(Diagnostic::error(format!(
+                                "wrong number of arguments: expected {}, found {}",
+                                explicit_param_tys.len(), args.len()
+                            )).with_span(*span));
+                        }
+                        let mut hir_args = Vec::new();
+                        for (i, arg) in args.iter().enumerate() {
+                            let expected = explicit_param_tys.get(i).copied().unwrap_or(self.ctx.error());
+                            let hir_arg = self.check_expr(arg, Expectation::HasType(expected))?;
+                            hir_args.push(hir_arg);
+                        }
+                        // Build the HIR: the callee is the field access; we keep it as-is
+                        let callee_hir = HirExpr::FieldAccess {
+                            base: Box::new(base_hir),
+                            field: field.clone(),
+                            ty: ret_ty,
+                            span: *span,
+                        };
+                        return Ok((HirExpr::Call { callee: Box::new(callee_hir), args: hir_args, comptime: *comptime, ty: ret_ty, span: *span }, ret_ty));
+                    } else {
+                        // Method not found — collect available method names for a helpful error
+                        let mut method_names: Vec<String> = Vec::new();
+                        for ty in self.autoderef_chain(base_ty) {
+                            for cand in self.trait_env.lookup_impls_for_type(ty) {
+                                for m in &cand.methods {
+                                    if !method_names.contains(&m.name) {
+                                        method_names.push(m.name.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let mut diag = Diagnostic::error(format!("no method named `{}` found for type", field))
+                            .with_code("E011")
+                            .with_span(*span);
+                        if !method_names.is_empty() {
+                            diag = diag.with_suggestion(format!("available methods: {}", method_names.join(", ")));
+                        }
+                        self.diagnostics.push(diag);
+                        return Ok((HirExpr::Error(*span), self.ctx.error()));
                     }
                 }
 
-                Ok((
-                    HirExpr::BinaryOp {
-                        left: Box::new(left_hir),
-                        op: *op,
-                        right: Box::new(right_hir),
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
-            }
-            Expr::UnaryOp { op, expr, span } => {
-                let (hir, ty) = self.synthesize(expr)?;
-                let result_ty = ty;
-                Ok((
-                    HirExpr::UnaryOp {
-                        op: *op,
-                        expr: Box::new(hir),
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
-            }
-            Expr::Call {
-                callee,
-                args,
-                comptime,
-                span,
-            } => {
-                let (callee_hir, callee_ty) = self.synthesize(callee)?;
-
-                let (param_tys, ret_ty) = if let Some(params) = self.ctx.params_of_fn(callee_ty) {
-                    (
-                        params.to_vec(),
-                        self.ctx.ret_of_fn(callee_ty).unwrap_or(self.ctx.error()),
-                    )
+                let (callee_hir, callee_ty) = self.infer_expr(callee)?;
+                if let Some(params) = self.ctx.params_of_fn(callee_ty) {
+                    let param_tys = params.to_vec();
+                    let ret_ty = self.ctx.ret_of_fn(callee_ty).unwrap_or(self.ctx.error());
+                    if param_tys.len() != args.len() {
+                        self.diagnostics.push(Diagnostic::error(format!(
+                            "wrong number of arguments: expected {}, found {}", param_tys.len(), args.len()
+                        )).with_span(*span));
+                    }
+                    let mut hir_args = Vec::new();
+                    for (i, arg) in args.iter().enumerate() {
+                        let expected = param_tys.get(i).copied().unwrap_or(self.ctx.error());
+                        let hir_arg = self.check_expr(arg, Expectation::HasType(expected))?;
+                        hir_args.push(hir_arg);
+                    }
+                    Ok((HirExpr::Call { callee: Box::new(callee_hir), args: hir_args, comptime: *comptime, ty: ret_ty, span: *span }, ret_ty))
                 } else {
-                    self.diagnostics.push(
-                        Diagnostic::error("called expression is not a function").with_span(*span),
-                    );
-                    (vec![self.ctx.error(); args.len()], self.ctx.error())
-                };
-
-                if param_tys.len() != args.len() {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "wrong number of arguments: expected {}, found {}",
-                            param_tys.len(),
-                            args.len()
-                        ))
-                        .with_span(*span),
-                    );
+                    self.diagnostics.push(Diagnostic::error("called expression is not a function").with_span(*span));
+                    Ok((HirExpr::Error(*span), self.ctx.error()))
                 }
-
-                let mut hir_args = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
-                    let expected = if i < param_tys.len() {
-                        param_tys[i]
-                    } else {
-                        self.ctx.error()
-                    };
-                    let (hir, actual) = self.synthesize(arg)?;
-                    self.unify(expected, actual, hir.span())?;
-                    hir_args.push(hir);
-                }
-                Ok((
-                    HirExpr::Call {
-                        callee: Box::new(callee_hir),
-                        args: hir_args,
-                        comptime: *comptime,
-                        ty: ret_ty,
-                        span: *span,
-                    },
-                    ret_ty,
-                ))
             }
             Expr::Index { base, index, span } => {
-                let elem_ty = self.new_infer_var(TypeVariableKind::Any);
-                let (base_hir, base_actual) = self.synthesize(base)?;
-                let (index_hir, index_actual) = self.synthesize(index)?;
-
-                let resolved_elem = if let Some(slice_ty) = self.ctx.elem_of_slice(base_actual) {
-                    slice_ty
-                } else if let Some(arr_ty) = self.ctx.elem_of_array(base_actual) {
-                    arr_ty
-                } else {
-                    self.diagnostics.push(
-                        Diagnostic::error("indexing on non-array/non-slice type").with_span(*span),
-                    );
-                    self.ctx.error()
-                };
-                self.add_constraint(Constraint::Eq(elem_ty, resolved_elem, *span));
-                if !self.ctx.is_integer(index_actual) && !self.ctx.is_usize(index_actual) {
-                    self.diagnostics
-                        .push(Diagnostic::error("index must be an integer").with_span(*span));
+                let (base_hir, base_ty) = self.infer_expr(base)?;
+                let (index_hir, index_ty) = self.infer_expr(index)?;
+                let elem_ty = self.ctx.elem_of_slice(base_ty)
+                    .or_else(|| self.ctx.elem_of_array(base_ty))
+                    .unwrap_or_else(|| {
+                        self.diagnostics.push(Diagnostic::error("indexing on non-array/non-slice type").with_span(*span));
+                        self.ctx.error()
+                    });
+                if !self.ctx.is_integer(index_ty) && !self.ctx.is_usize(index_ty) {
+                    self.diagnostics.push(Diagnostic::error("index must be an integer").with_span(*span));
                 }
-                Ok((
-                    HirExpr::Index {
-                        base: Box::new(base_hir),
-                        index: Box::new(index_hir),
-                        ty: elem_ty,
-                        span: *span,
-                    },
-                    elem_ty,
-                ))
+                Ok((HirExpr::Index { base: Box::new(base_hir), index: Box::new(index_hir), ty: elem_ty, span: *span }, elem_ty))
             }
             Expr::FieldAccess { base, field, span } => {
-                let (base_hir, base_actual) = self.synthesize(base)?;
-                let field_ty = self.lookup_field(base_actual, field, *span)?;
-                Ok((
-                    HirExpr::FieldAccess {
-                        base: Box::new(base_hir),
-                        field: field.clone(),
-                        ty: field_ty,
-                        span: *span,
-                    },
-                    field_ty,
-                ))
+                let (base_hir, base_ty) = self.infer_expr(base)?;
+                let field_ty = self.lookup_field(base_ty, field, *span)?;
+                Ok((HirExpr::FieldAccess { base: Box::new(base_hir), field: field.clone(), ty: field_ty, span: *span }, field_ty))
             }
             Expr::AttrAccess { base, attr, span } => {
-                let (base_hir, base_actual) = self.synthesize(base)?;
-                let attr_ty = self.lookup_attr(base_actual, attr, *span)?;
-                Ok((
-                    HirExpr::AttrAccess {
-                        base: Box::new(base_hir),
-                        attr: attr.clone(),
-                        ty: attr_ty,
-                        span: *span,
-                    },
-                    attr_ty,
-                ))
+                let (base_hir, base_ty) = self.infer_expr(base)?;
+                let attr_ty = self.lookup_attr(base_ty, attr, *span)?;
+                Ok((HirExpr::AttrAccess { base: Box::new(base_hir), attr: attr.clone(), ty: attr_ty, span: *span }, attr_ty))
             }
-            Expr::Cast {
-                expr,
-                ty,
-                safe,
-                rounding,
-                span,
-            } => {
-                let (hir, actual_ty) = self.synthesize(expr)?;
+            Expr::Cast { expr, ty, safe, rounding, span } => {
+                let (hir, actual_ty) = self.infer_expr(expr)?;
                 let target_ty = self.resolve_type(ty)?;
                 let cast_ty = self.check_cast(actual_ty, target_ty, *safe, *span)?;
-                Ok((
-                    HirExpr::Cast {
-                        expr: Box::new(hir),
-                        ty: cast_ty,
-                        safe: *safe,
-                        rounding: *rounding,
-                        span: *span,
-                    },
-                    cast_ty,
-                ))
+                Ok((HirExpr::Cast { expr: Box::new(hir), ty: cast_ty, safe: *safe, rounding: *rounding, span: *span }, cast_ty))
             }
-            Expr::Range {
-                start,
-                end,
-                inclusive,
-                span,
-            } => {
-                let start_hir = if let Some(start) = start {
-                    Some(Box::new(self.synthesize(start)?.0))
-                } else {
-                    None
-                };
-                let end_hir = if let Some(end) = end {
-                    Some(Box::new(self.synthesize(end)?.0))
-                } else {
-                    None
-                };
+            Expr::Range { start, end, inclusive, span } => {
+                let start_hir = start.as_ref().map(|s| self.infer_expr(s).map(|(h, _)| h)).transpose()?;
+                let end_hir = end.as_ref().map(|e| self.infer_expr(e).map(|(h, _)| h)).transpose()?;
                 let int_ty = self.ctx.int(32, true);
                 let ty = self.ctx.tuple(vec![int_ty, int_ty]);
-                Ok((
-                    HirExpr::Range {
-                        start: start_hir,
-                        end: end_hir,
-                        inclusive: *inclusive,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
+                Ok((HirExpr::Range { start: start_hir.map(Box::new), end: end_hir.map(Box::new), inclusive: *inclusive, ty, span: *span }, ty))
             }
             Expr::StructLit { path, fields, span } => {
-                let type_ast = Type::Path(path.clone(), *span);
-                let resolved_ty = self.resolve_type(&type_ast)?;
+                let resolved_ty = self.resolve_type(&Type::Path(path.clone(), *span))?;
                 let (def_id, args) = self.resolve_type_to_struct_or_enum(resolved_ty, *span)?;
-                let binding = self
-                    .symbols
-                    .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
                 if !matches!(binding.kind, TypeKind::Struct) {
                     return Err(Diagnostic::error("not a struct type").with_span(*span));
                 }
                 let struct_ty = self.ctx.struct_ty(def_id, args.clone());
                 let mut subst = Subst::new();
-                for (i, param) in binding.params.iter().enumerate() {
-                    if let Some(&arg) = args.get(i) {
-                        subst.insert(i, arg);
-                    }
+                for (i, _param) in binding.params.iter().enumerate() {
+                    if let Some(&arg) = args.get(i) { subst.insert(i, arg); }
                 }
-
                 let mut hir_fields = Vec::new();
                 for (name, value) in fields {
-                    let field_def =
-                        binding
-                            .fields
-                            .iter()
-                            .find(|f| f.name == *name)
-                            .ok_or_else(|| {
-                                Diagnostic::error(format!("field '{}' not found", name))
-                                    .with_span(*span)
-                            })?;
+                    let field_def = binding.fields.iter().find(|f| f.name == *name)
+                        .ok_or_else(|| {
+                            let field_names: Vec<String> = binding.fields.iter().map(|f| f.name.clone()).collect();
+                            let mut diag = Diagnostic::error(format!("field '{}' not found in struct", name))
+                                .with_code("E010")
+                                .with_span(*span)
+                                .with_suggestion(format!("available fields: {}", field_names.join(", ")));
+                            if let Some(suggestion) = did_you_mean_suggestion(name, &field_names) {
+                                diag = diag.with_suggestion(suggestion);
+                            }
+                            diag
+                        })?;
                     let field_ty = self.ctx.subst(field_def.ty, &subst);
-                    let (hir, _) = self.synthesize(value)?;
+                    let hir = self.check_expr(value, Expectation::HasType(field_ty))?;
                     self.unify(field_ty, hir.ty(), *span)?;
                     hir_fields.push((name.clone(), Box::new(hir)));
                 }
-
-                Ok((
-                    HirExpr::StructLit {
-                        path: path.clone(),
-                        fields: hir_fields,
-                        ty: struct_ty,
-                        span: *span,
-                    },
-                    struct_ty,
-                ))
+                Ok((HirExpr::StructLit { path: path.clone(), fields: hir_fields, ty: struct_ty, span: *span }, struct_ty))
             }
-            Expr::EnumLit {
-                path,
-                variant,
-                payload,
-                span,
-            } => {
-                let type_ast = Type::Path(path.clone(), *span);
-                let resolved_ty = self.resolve_type(&type_ast)?;
+            Expr::EnumLit { path, variant, payload, span } => {
+                let resolved_ty = self.resolve_type(&Type::Path(path.clone(), *span))?;
                 let (def_id, args) = self.resolve_type_to_struct_or_enum(resolved_ty, *span)?;
-                let binding = self
-                    .symbols
-                    .lookup_type_by_def_id(def_id)
-                    .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
                 if !matches!(binding.kind, TypeKind::Enum) {
                     return Err(Diagnostic::error("not an enum type").with_span(*span));
                 }
                 let enum_ty = self.ctx.enum_ty(def_id, args.clone());
                 let mut subst = Subst::new();
-                for (i, param) in binding.params.iter().enumerate() {
-                    if let Some(&arg) = args.get(i) {
-                        subst.insert(i, arg);
-                    }
+                for (i, _param) in binding.params.iter().enumerate() {
+                    if let Some(&arg) = args.get(i) { subst.insert(i, arg); }
                 }
-
+                let variant_def = binding.variants.iter().find(|v| v.name == *variant)
+                    .ok_or_else(|| Diagnostic::error(format!("variant '{}' not found", variant)).with_span(*span))?;
+                let payload_ty = variant_def.payload.as_ref().map(|ty| self.resolve_type(ty)).transpose()?.unwrap_or(self.ctx.error());
                 let payload_hir = if let Some(payload) = payload {
-                    let variant_def = binding
-                        .variants
-                        .iter()
-                        .find(|v| v.name == *variant)
-                        .ok_or_else(|| {
-                            Diagnostic::error(format!("variant '{}' not found", variant))
-                                .with_span(*span)
-                        })?;
-                    let payload_ty = match &variant_def.payload {
-                        Some(payload_ty) => self.resolve_type(payload_ty)?,
-                        None => self.ctx.error(),
-                    };
-                    let (hir, _) = self.synthesize(payload)?;
+                    let hir = self.check_expr(payload, Expectation::HasType(payload_ty))?;
                     self.unify(payload_ty, hir.ty(), *span)?;
                     Some(Box::new(hir))
-                } else {
-                    None
-                };
-
-                Ok((
-                    HirExpr::EnumLit {
-                        path: path.clone(),
-                        variant: variant.clone(),
-                        payload: payload_hir,
-                        ty: enum_ty,
-                        span: *span,
-                    },
-                    enum_ty,
-                ))
+                } else { None };
+                Ok((HirExpr::EnumLit { path: path.clone(), variant: variant.clone(), payload: payload_hir, ty: enum_ty, span: *span }, enum_ty))
             }
             Expr::Move(expr, span) => {
-                let (hir, ty) = self.synthesize(expr)?;
+                let (hir, ty) = self.infer_expr(expr)?;
                 Ok((HirExpr::Move(Box::new(hir), ty, *span), ty))
             }
             Expr::Tuple(exprs, span) => {
                 let mut hirs = Vec::new();
                 let mut types = Vec::new();
                 for e in exprs {
-                    let (hir, ty) = self.synthesize(e)?;
+                    let (hir, ty) = self.infer_expr(e)?;
                     hirs.push(hir);
                     types.push(ty);
                 }
@@ -1092,264 +1044,104 @@ impl<'a> TypeChecker<'a> {
                 let mut hirs = Vec::new();
                 let mut elem_ty = None;
                 for e in exprs {
-                    let (hir, ty) = self.synthesize(e)?;
+                    let (hir, ty) = self.infer_expr(e)?;
+                    if let Some(et) = elem_ty {
+                        self.unify(et, ty, *span)?;
+                    } else { elem_ty = Some(ty); }
                     hirs.push(hir);
-                    if elem_ty.is_none() {
-                        elem_ty = Some(ty);
-                    } else {
-                        self.unify(elem_ty.unwrap(), ty, *span)?;
-                    }
                 }
-                let ty = self
-                    .ctx
-                    .array(elem_ty.unwrap_or(self.ctx.error()), exprs.len() as u64);
+                let ty = self.ctx.array(elem_ty.unwrap_or(self.ctx.error()), exprs.len() as u64);
                 Ok((HirExpr::Array(hirs, ty, *span), ty))
             }
-            Expr::Closure {
-                params,
-                return_type,
-                captures,
-                body,
-                span,
-            } => {
+            Expr::Closure { params, return_type, captures, body, span } => {
                 let mut hir_params = Vec::new();
                 let mut param_tys = Vec::new();
                 for param in params {
-                    let ty = if let Some(ty) = &param.ty {
-                        self.resolve_type(ty)?
-                    } else {
-                        self.ctx.error()
-                    };
-                    hir_params.push(HirParam {
-                        name: param.name.clone(),
-                        ty,
-                        default: None,
-                        span: param.span,
-                    });
+                    let ty = param.ty.as_ref().map(|t| self.resolve_type(t)).unwrap_or(Ok(self.ctx.error()))?;
+                    hir_params.push(HirParam { name: param.name.clone(), ty, default: None, span: param.span });
                     param_tys.push(ty);
                 }
-
-                let ret_ty = if let Some(ret) = return_type {
-                    self.resolve_type(ret)?
-                } else {
-                    self.ctx.unit()
-                };
-
+                let ret_ty = return_type.as_ref().map(|t| self.resolve_type(t)).unwrap_or(Ok(self.ctx.unit()))?;
+                self.push_ctx(CtxKind::Closure, *span, None);
                 let body_hir = self.check_block(body)?;
+                self.pop_ctx();
                 let ty = self.ctx.function(param_tys, ret_ty);
-
-                Ok((
-                    HirExpr::Closure {
-                        params: hir_params,
-                        return_type: ret_ty,
-                        captures: captures.clone(),
-                        body: body_hir,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
+                Ok((HirExpr::Closure { params: hir_params, return_type: ret_ty, captures: captures.clone(), body: body_hir, ty, span: *span }, ty))
             }
             Expr::Try { expr, span } => {
-                let (hir, ty) = self.synthesize(expr)?;
-                let result_ty = self.check_result_type(ty, *span)?;
-                Ok((
-                    HirExpr::Try {
-                        expr: Box::new(hir),
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
+                let (hir, ty) = self.infer_expr(expr)?;
+                let ok_ty = self.check_result_type(ty, *span)?;
+                Ok((HirExpr::Try { expr: Box::new(hir), ty: ok_ty, span: *span }, ok_ty))
             }
             Expr::UnsafeBlock { body, span } => {
                 let body_hir = self.check_block(body)?;
                 let ty = self.ctx.unit();
-                Ok((
-                    HirExpr::UnsafeBlock {
-                        body: body_hir,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
+                Ok((HirExpr::UnsafeBlock { body: body_hir, ty, span: *span }, ty))
             }
-            Expr::Catch {
-                expr,
-                branches,
-                span,
-            } => {
-                let (expr_hir, expr_ty) = self.synthesize(expr)?;
+            Expr::Catch { expr, branches, span } => {
+                let (expr_hir, expr_ty) = self.infer_expr(expr)?;
                 let (ok_ty, error_ty) = self.extract_result_types(expr_ty, *span)?;
-
                 let mut hir_branches = Vec::new();
                 for branch in branches {
                     let pattern_hir = self.check_pattern(&branch.pattern, error_ty)?;
                     let body_hir = self.check_block(&branch.body)?;
-                    hir_branches.push(HirCatchBranch {
-                        pattern: pattern_hir,
-                        bind: branch.bind.clone(),
-                        body: body_hir,
-                        span: branch.span,
-                    });
+                    hir_branches.push(HirCatchBranch { pattern: pattern_hir, bind: branch.bind.clone(), body: body_hir, span: branch.span });
                 }
-
-                Ok((
-                    HirExpr::Catch {
-                        expr: Box::new(expr_hir),
-                        branches: hir_branches,
-                        ty: ok_ty,
-                        span: *span,
-                    },
-                    ok_ty,
-                ))
+                Ok((HirExpr::Catch { expr: Box::new(expr_hir), branches: hir_branches, ty: ok_ty, span: *span }, ok_ty))
             }
             Expr::LeaveWith { expr, span } => {
-                let (hir, _) = self.synthesize(expr)?;
+                let (hir, _) = self.infer_expr(expr)?;
                 let never = self.ctx.never();
-                Ok((
-                    HirExpr::LeaveWith {
-                        expr: Box::new(hir),
-                        ty: never,
-                        span: *span,
-                    },
-                    never,
-                ))
+                Ok((HirExpr::LeaveWith { expr: Box::new(hir), ty: never, span: *span }, never))
             }
             Expr::Await { expr, span } => {
-                let (hir, ty) = self.synthesize(expr)?;
+                let (hir, ty) = self.infer_expr(expr)?;
                 let future_ty = self.check_future_type(ty, *span)?;
-                Ok((
-                    HirExpr::Await {
-                        expr: Box::new(hir),
-                        ty: future_ty,
-                        span: *span,
-                    },
-                    future_ty,
-                ))
+                Ok((HirExpr::Await { expr: Box::new(hir), ty: future_ty, span: *span }, future_ty))
             }
-            Expr::If {
-                cond,
-                then_branch,
-                else_branch,
-                is_expression,
-                span,
-            } => {
-                let (cond_hir, cond_ty) = self.synthesize(cond)?;
+            Expr::If { cond, then_branch, else_branch, is_expression, span } => {
+                let (cond_hir, cond_ty) = self.infer_expr(cond)?;
                 if !self.ctx.is_bool(cond_ty) {
-                    self.diagnostics
-                        .push(Diagnostic::error("if condition must be boolean").with_span(*span));
+                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span));
                 }
-
                 let then_hir = self.check_block(then_branch)?;
                 let then_ty = self.block_type(&then_hir);
-
-                let else_hir = if let Some(else_branch) = else_branch {
-                    Some(self.check_block(else_branch)?)
-                } else {
-                    None
-                };
-
-                let result_ty = if *is_expression {
-                    let else_ty = if let Some(else_hir) = &else_hir {
-                        self.block_type(else_hir)
-                    } else {
-                        self.ctx.unit()
-                    };
+                let else_hir = else_branch.as_ref().map(|b| self.check_block(b)).transpose()?;
+                let else_ty = else_hir.as_ref().map(|h| self.block_type(h)).unwrap_or(self.ctx.unit());
+                if *is_expression {
                     self.unify(then_ty, else_ty, *span)?;
-                    then_ty
-                } else {
-                    self.ctx.unit()
-                };
-
-                Ok((
-                    HirExpr::If {
-                        cond: Box::new(cond_hir),
-                        then_branch: then_hir,
-                        else_branch: else_hir,
-                        is_expression: *is_expression,
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
+                }
+                let result_ty = if *is_expression { then_ty } else { self.ctx.unit() };
+                Ok((HirExpr::If { cond: Box::new(cond_hir), then_branch: then_hir, else_branch: else_hir, is_expression: *is_expression, ty: result_ty, span: *span }, result_ty))
             }
-            Expr::IfLet {
-                pattern,
-                scrutinee,
-                then_branch,
-                else_branch,
-                span,
-            } => {
-                let (scrut_hir, scrut_ty) = self.synthesize(scrutinee)?;
+            Expr::IfLet { pattern, scrutinee, then_branch, else_branch, span } => {
+                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
                 let pattern_hir = self.check_pattern(pattern, scrut_ty)?;
                 let then_hir = self.check_block(then_branch)?;
-                let else_hir = if let Some(else_branch) = else_branch {
-                    Some(self.check_block(else_branch)?)
-                } else {
-                    None
-                };
-
+                let else_hir = else_branch.as_ref().map(|b| self.check_block(b)).transpose()?;
                 let ty = self.ctx.unit();
-                Ok((
-                    HirExpr::IfLet {
-                        pattern: pattern_hir,
-                        scrutinee: Box::new(scrut_hir),
-                        then_branch: then_hir,
-                        else_branch: else_hir,
-                        ty,
-                        span: *span,
-                    },
-                    ty,
-                ))
+                Ok((HirExpr::IfLet { pattern: pattern_hir, scrutinee: Box::new(scrut_hir), then_branch: then_hir, else_branch: else_hir, ty, span: *span }, ty))
             }
-            Expr::Match {
-                scrutinee,
-                arms,
-                span,
-            } => {
-                let (scrut_hir, scrut_ty) = self.synthesize(scrutinee)?;
-
+            Expr::Match { scrutinee, arms, span } => {
+                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
                 let mut hir_arms = Vec::new();
                 let mut arm_ty = None;
                 for arm in arms {
                     let pattern_hir = self.check_pattern(&arm.pattern, scrut_ty)?;
-                    let guard_hir = if let Some(guard) = &arm.guard {
-                        let (hir, ty) = self.synthesize(guard)?;
+                    let guard_hir = arm.guard.as_ref().map(|g| self.infer_expr(g).map(|(h, ty)| {
                         if !self.ctx.is_bool(ty) {
-                            self.diagnostics.push(
-                                Diagnostic::error("match guard must be boolean")
-                                    .with_span(arm.span),
-                            );
+                            self.diagnostics.push(Diagnostic::error("match guard must be boolean").with_span(arm.span));
                         }
-                        Some(Box::new(hir))
-                    } else {
-                        None
-                    };
-                    let (body_hir, body_ty) = self.synthesize(&arm.body)?;
-                    if arm_ty.is_none() {
-                        arm_ty = Some(body_ty);
-                    } else {
-                        self.unify(arm_ty.unwrap(), body_ty, arm.span)?;
-                    }
-                    hir_arms.push(HirMatchArm {
-                        pattern: pattern_hir,
-                        guard: guard_hir,
-                        body: Box::new(body_hir),
-                        span: arm.span,
-                    });
+                        Box::new(h)
+                    })).transpose()?;
+                    let (body_hir, body_ty) = self.infer_expr(&arm.body)?;
+                    if let Some(prev) = arm_ty {
+                        self.unify(prev, body_ty, arm.span)?;
+                    } else { arm_ty = Some(body_ty); }
+                    hir_arms.push(HirMatchArm { pattern: pattern_hir, guard: guard_hir, body: Box::new(body_hir), span: arm.span });
                 }
-
                 let result_ty = arm_ty.unwrap_or(self.ctx.unit());
-                Ok((
-                    HirExpr::Match {
-                        scrutinee: Box::new(scrut_hir),
-                        arms: hir_arms,
-                        ty: result_ty,
-                        span: *span,
-                    },
-                    result_ty,
-                ))
+                Ok((HirExpr::Match { scrutinee: Box::new(scrut_hir), arms: hir_arms, ty: result_ty, span: *span }, result_ty))
             }
             Expr::Block(stmts, span) => {
                 let hir_stmts = self.check_block(stmts)?;
@@ -1360,49 +1152,322 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn check_expr(&mut self, expr: &Expr, expected: Expectation) -> Result<HirExpr, Diagnostic> {
+        match expr {
+            Expr::Literal(_lit, span) => {
+                let (hir, ty) = self.infer_expr(expr)?;
+                if let Expectation::HasType(expected_ty) = expected {
+                    self.unify(expected_ty, ty, *span)?;
+                }
+                Ok(hir)
+            }
+            Expr::Ident(_, _) | Expr::TypeAnnotated { .. } => {
+                let (hir, ty) = self.infer_expr(expr)?;
+                if let Expectation::HasType(expected_ty) = expected {
+                    self.unify(expected_ty, ty, expr.span())?;
+                }
+                Ok(hir)
+            }
+            Expr::If { cond, then_branch, else_branch, is_expression, span } => {
+                if !*is_expression {
+                    return Err(Diagnostic::error("statement `if` used in check context").with_span(*span));
+                }
+                let (cond_hir, cond_ty) = self.infer_expr(cond)?;
+                if !self.ctx.is_bool(cond_ty) {
+                    self.diagnostics.push(Diagnostic::error("if condition must be boolean").with_code("E004").with_span(*span));
+                }
+                let then_hir = self.check_block(then_branch)?;
+                let then_ty = self.block_type(&then_hir);
+                let else_hir = else_branch.as_ref().map(|b| self.check_block(b)).transpose()?;
+                let else_ty = else_hir.as_ref().map(|h| self.block_type(h)).unwrap_or(self.ctx.unit());
+                let expected_ty = match expected {
+                    Expectation::HasType(ty) | Expectation::CastableToType(ty) => ty,
+                    Expectation::None => self.new_infer_var(TypeVariableKind::Unconstrained),
+                };
+                self.unify(expected_ty, then_ty, *span)?;
+                self.unify(expected_ty, else_ty, *span)?;
+                Ok(HirExpr::If { cond: Box::new(cond_hir), then_branch: then_hir, else_branch: else_hir, is_expression: true, ty: expected_ty, span: *span })
+            }
+            Expr::Match { scrutinee, arms, span } => {
+                let (scrut_hir, scrut_ty) = self.infer_expr(scrutinee)?;
+                let mut hir_arms = Vec::new();
+                for arm in arms {
+                    let pattern_hir = self.check_pattern(&arm.pattern, scrut_ty)?;
+                    let guard_hir = arm.guard.as_ref().map(|g| self.infer_expr(g).map(|(h, ty)| {
+                        if !self.ctx.is_bool(ty) {
+                            self.diagnostics.push(Diagnostic::error("match guard must be boolean").with_span(arm.span));
+                        }
+                        Box::new(h)
+                    })).transpose()?;
+                    let body_hir = self.check_expr(&arm.body, expected)?;
+                    hir_arms.push(HirMatchArm { pattern: pattern_hir, guard: guard_hir, body: Box::new(body_hir), span: arm.span });
+                }
+                let expected_ty = match expected {
+                    Expectation::HasType(ty) | Expectation::CastableToType(ty) => ty,
+                    Expectation::None => {
+                        let last_arm = hir_arms.last().map(|a| a.body.ty()).unwrap_or(self.ctx.unit());
+                        last_arm
+                    }
+                };
+                Ok(HirExpr::Match { scrutinee: Box::new(scrut_hir), arms: hir_arms, ty: expected_ty, span: *span })
+            }
+            Expr::Block(stmts, span) => {
+                let hir_stmts = self.check_block(stmts)?;
+                let ty = self.block_type(&hir_stmts);
+                let expected_ty = match expected {
+                    Expectation::HasType(expected_ty) => {
+                        self.unify(expected_ty, ty, *span)?;
+                        expected_ty
+                    }
+                    Expectation::CastableToType(expected_ty) => {
+                        self.unify(expected_ty, ty, *span)?;
+                        expected_ty
+                    }
+                    Expectation::None => ty,
+                };
+                Ok(HirExpr::Block(hir_stmts, expected_ty, *span))
+            }
+            _ => {
+                let (hir, ty) = self.infer_expr(expr)?;
+                if let Expectation::HasType(expected_ty) = expected {
+                    self.unify(expected_ty, ty, expr.span())?;
+                }
+                Ok(hir)
+            }
+        }
+    }
+
+    fn check_pattern(&mut self, pattern: &Pattern, expected_ty: TypeId) -> Result<HirPattern, Diagnostic> {
+        if self.ctx.is_infer_var(expected_ty) {
+            match pattern {
+                Pattern::Tuple(patterns, span) => {
+                    let elem_tys: Vec<TypeId> = patterns.iter().map(|_| self.new_infer_var(TypeVariableKind::Unconstrained)).collect();
+                    let tuple_ty = self.ctx.tuple(elem_tys.clone());
+                    self.unify(expected_ty, tuple_ty, *span)?;
+                    let mut hir_pats = Vec::new();
+                    for (pat, &ety) in patterns.iter().zip(elem_tys.iter()) {
+                        hir_pats.push(self.check_pattern(pat, ety)?);
+                    }
+                    return Ok(HirPattern::Tuple(hir_pats, *span));
+                }
+                Pattern::Struct { path, fields, span } => {
+                    let def_id = self.resolve_def_id(path)?;
+                    let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
+                    if !matches!(binding.kind, TypeKind::Struct) {
+                        return Err(Diagnostic::error("pattern type is not a struct").with_span(*span));
+                    }
+                    let type_args = vec![self.new_infer_var(TypeVariableKind::Unconstrained); binding.params.len()];
+                    let struct_ty = self.ctx.struct_ty(def_id, type_args.clone());
+                    self.unify(expected_ty, struct_ty, *span)?;
+                    let mut subst = Subst::new();
+                    for (i, _) in binding.params.iter().enumerate() {
+                        subst.insert(i, type_args[i]);
+                    }
+                    let mut hir_fields = Vec::new();
+                    for (name, pat) in fields {
+                        let field_def = binding.fields.iter().find(|f| f.name == *name)
+                            .ok_or_else(|| {
+                                let field_names: Vec<String> = binding.fields.iter().map(|f| f.name.clone()).collect();
+                                let mut diag = Diagnostic::error(format!("field '{}' not found in struct", name))
+                                    .with_code("E010")
+                                    .with_span(*span)
+                                    .with_suggestion(format!("available fields: {}", field_names.join(", ")));
+                                if let Some(suggestion) = did_you_mean_suggestion(name, &field_names) {
+                                    diag = diag.with_suggestion(suggestion);
+                                }
+                                diag
+                            })?;
+                        let field_ty = self.ctx.subst(field_def.ty, &subst);
+                        hir_fields.push((name.clone(), Box::new(self.check_pattern(pat, field_ty)?)));
+                    }
+                    return Ok(HirPattern::Struct { path: path.clone(), fields: hir_fields, span: *span });
+                }
+                Pattern::Enum { path, variant, inner, span } => {
+                    let def_id = self.resolve_def_id(path)?;
+                    let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
+                    if !matches!(binding.kind, TypeKind::Enum) {
+                        return Err(Diagnostic::error("pattern type is not an enum").with_span(*span));
+                    }
+                    let type_args = vec![self.new_infer_var(TypeVariableKind::Unconstrained); binding.params.len()];
+                    let enum_ty = self.ctx.enum_ty(def_id, type_args.clone());
+                    self.unify(expected_ty, enum_ty, *span)?;
+                    let mut subst = Subst::new();
+                    for (i, _) in binding.params.iter().enumerate() { subst.insert(i, type_args[i]); }
+                    let variant_def = binding.variants.iter().find(|v| v.name == *variant)
+                        .ok_or_else(|| Diagnostic::error(format!("variant '{}' not found", variant)).with_span(*span))?;
+                    let inner_ty = variant_def.payload.as_ref().map(|ty| self.resolve_type(ty)).unwrap_or(Ok(self.ctx.error()))?;
+                    let inner_hir = inner.as_ref().map(|inner| self.check_pattern(inner, inner_ty)).transpose()?;
+                    return Ok(HirPattern::Enum { path: path.clone(), variant: variant.clone(), inner: inner_hir.map(Box::new), span: *span });
+                }
+                _ => {}
+            }
+        }
+        match pattern {
+            Pattern::Wildcard(span) => Ok(HirPattern::Wildcard(*span)),
+            Pattern::Ident(name, span) => Ok(HirPattern::Ident(name.clone(), expected_ty, *span)),
+            Pattern::Literal(expr, span) => {
+                let (hir, ty) = self.infer_expr(expr)?;
+                self.unify(expected_ty, ty, *span)?;
+                Ok(HirPattern::Literal(Box::new(hir), *span))
+            }
+            Pattern::Tuple(patterns, span) => {
+                let expected_elems = self.ctx.tuple_elems(expected_ty).map(|e| e.to_vec())
+                    .unwrap_or_else(|| vec![self.ctx.error(); patterns.len()]);
+                let mut hir_patterns = Vec::new();
+                for (i, pat) in patterns.iter().enumerate() {
+                    let elem_ty = expected_elems.get(i).copied().unwrap_or(self.ctx.error());
+                    hir_patterns.push(self.check_pattern(pat, elem_ty)?);
+                }
+                Ok(HirPattern::Tuple(hir_patterns, *span))
+            }
+            Pattern::Struct { path, fields, span } => {
+                let (def_id, args) = self.resolve_type_to_struct_or_enum(expected_ty, *span)?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id)
+                    .ok_or_else(|| Diagnostic::error("struct not found").with_span(*span))?;
+                if !matches!(binding.kind, TypeKind::Struct) {
+                    return Err(Diagnostic::error("pattern type is not a struct").with_span(*span));
+                }
+                let mut subst = Subst::new();
+                for (i, _param) in binding.params.iter().enumerate() {
+                    if let Some(&arg) = args.get(i) { subst.insert(i, arg); }
+                }
+                let mut hir_fields = Vec::new();
+                for (name, pat) in fields {
+                    let field_ty = binding.fields.iter().find(|f| f.name == *name)
+                        .map(|f| self.ctx.subst(f.ty, &subst))
+                        .ok_or_else(|| {
+                            let available: Vec<_> = binding.fields.iter().map(|f| f.name.as_str()).collect();
+                            Diagnostic::error(format!("field '{}' not found in struct", name))
+                                .with_code("E010")
+                                .with_span(*span)
+                                .with_suggestion(format!("available fields: {}", available.join(", ")))
+                        })?;
+                    hir_fields.push((name.clone(), Box::new(self.check_pattern(pat, field_ty)?)));
+                }
+                Ok(HirPattern::Struct { path: path.clone(), fields: hir_fields, span: *span })
+            }
+            Pattern::Enum { path, variant, inner, span } => {
+                let (def_id, args) = self.resolve_type_to_struct_or_enum(expected_ty, *span)?;
+                let binding = self.symbols.lookup_type_by_def_id(def_id)
+                    .ok_or_else(|| Diagnostic::error("enum not found").with_span(*span))?;
+                if !matches!(binding.kind, TypeKind::Enum) {
+                    return Err(Diagnostic::error("pattern type is not an enum").with_span(*span));
+                }
+                let mut subst = Subst::new();
+                for (i, _param) in binding.params.iter().enumerate() {
+                    if let Some(&arg) = args.get(i) { subst.insert(i, arg); }
+                }
+                let variant_def = binding.variants.iter().find(|v| v.name == *variant)
+                    .ok_or_else(|| Diagnostic::error(format!("variant '{}' not found", variant)).with_span(*span))?;
+                let inner_ty = variant_def.payload.as_ref().map(|ty| self.resolve_type(ty)).unwrap_or(Ok(self.ctx.error()))?;
+                let inner_hir = inner.as_ref().map(|inner| self.check_pattern(inner, inner_ty)).transpose()?;
+                Ok(HirPattern::Enum { path: path.clone(), variant: variant.clone(), inner: inner_hir.map(Box::new), span: *span })
+            }
+            Pattern::Or(patterns, span) => {
+                let mut hir_patterns = Vec::new();
+                for pat in patterns {
+                    hir_patterns.push(self.check_pattern(pat, expected_ty)?);
+                }
+                Ok(HirPattern::Or(hir_patterns, *span))
+            }
+            Pattern::Slice(before, slice, after, span) => {
+                // Determine the element type from the expected type
+                let elem_ty = if self.ctx.is_infer_var(expected_ty) {
+                    let elem = self.new_infer_var(TypeVariableKind::Any);
+                    let slice_ty = self.ctx.slice(elem);
+                    self.unify(expected_ty, slice_ty, *span)?;
+                    elem
+                } else if let Some(elem) = self.ctx.elem_of_slice(expected_ty) {
+                    elem
+                } else if let Some(elem) = self.ctx.elem_of_array(expected_ty) {
+                    // If it's an array, check the length constraint
+                    let size = self.ctx.size_of_array(expected_ty).unwrap_or(0);
+                    let total = before.len() + after.len();
+                    if slice.is_none() {
+                        if size != total as u64 {
+                            self.diagnostics.push(
+                                Diagnostic::error(format!("expected array of length {}, but pattern matches {} elements", size, total))
+                                    .with_span(*span)
+                            );
+                        }
+                    } else if total as u64 > size {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!("array pattern exceeds array length {}: {} fixed elements", size, total))
+                                .with_span(*span)
+                        );
+                    }
+                    elem
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error("slice pattern requires array or slice type")
+                            .with_span(*span)
+                    );
+                    self.ctx.error()
+                };
+                let mut hir_before = Vec::new();
+                for pat in before {
+                    hir_before.push(self.check_pattern(pat, elem_ty)?);
+                }
+                let hir_slice = slice.as_ref().map(|pat| {
+                    let slice_elem_ty = self.ctx.slice(elem_ty);
+                    Ok(Box::new(self.check_pattern(pat, slice_elem_ty)?))
+                }).transpose()?;
+                let mut hir_after = Vec::new();
+                for pat in after {
+                    hir_after.push(self.check_pattern(pat, elem_ty)?);
+                }
+                Ok(HirPattern::Slice(hir_before, hir_slice, hir_after, *span))
+            }
+            Pattern::Error(span) => Ok(HirPattern::Error(*span)),
+        }
+    }
+
     fn resolve_type(&mut self, ty: &Type) -> Result<TypeId, Diagnostic> {
         match ty {
             Type::Path(path, span) => {
-                let def_id = match self.resolve_def_id(path) {
-                    Ok(did) => did,
-                    Err(_) => {
-                        let name = &path[0];
-                        return match name.as_str() {
-                            "Bool" => Ok(self.ctx.bool()),
-                            "Char" => Ok(self.ctx.char()),
-                            "Byte" => Ok(self.ctx.byte()),
-                            "USize" => Ok(self.ctx.usize()),
-                            "Unit" => Ok(self.ctx.unit()),
-                            "Never" => Ok(self.ctx.never()),
-                            _ => Err(Diagnostic::error(format!("type '{}' not found", name))
-                                .with_span(*span)),
-                        };
-                    }
-                };
-                let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| {
-                    Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span)
-                })?;
-                match binding.kind {
-                    TypeKind::Alias => {
-                        if self.resolving_aliases.contains(&def_id) {
-                            return Err(
-                                Diagnostic::error("circular alias definition").with_span(*span)
-                            );
+                if let Ok(def_id) = self.resolve_def_id(path) {
+                    let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span))?;
+                    match binding.kind {
+                        TypeKind::Alias => {
+                            if self.resolving_aliases.contains(&def_id) {
+                                return Err(Diagnostic::error("circular alias definition").with_span(*span));
+                            }
+                            self.resolving_aliases.insert(def_id);
+                            let result = binding.alias_ast.as_ref().map(|ast| self.resolve_type(ast)).unwrap_or(Err(Diagnostic::error("alias has no body").with_span(*span)));
+                            self.resolving_aliases.remove(&def_id);
+                            result
                         }
-                        self.resolving_aliases.insert(def_id);
-                        let result = if let Some(ast) = &binding.alias_ast {
-                            self.resolve_type(ast)
-                        } else {
-                            Err(Diagnostic::error("alias has no body").with_span(*span))
-                        };
-                        self.resolving_aliases.remove(&def_id);
-                        result
+                        TypeKind::Struct => {
+                            if binding.params.is_empty() {
+                                Ok(self.ctx.struct_ty(def_id, vec![]))
+                            } else {
+                                let args: Vec<TypeId> = (0..binding.params.len())
+                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                                    .collect();
+                                Ok(self.ctx.struct_ty(def_id, args))
+                            }
+                        }
+                        TypeKind::Enum => {
+                            if binding.params.is_empty() {
+                                Ok(self.ctx.enum_ty(def_id, vec![]))
+                            } else {
+                                let args: Vec<TypeId> = (0..binding.params.len())
+                                    .map(|_| self.new_infer_var(TypeVariableKind::Unconstrained))
+                                    .collect();
+                                Ok(self.ctx.enum_ty(def_id, args))
+                            }
+                        }
+                        _ => Err(Diagnostic::error("expected type, found something else").with_span(*span)),
                     }
-                    TypeKind::Struct => Ok(self.ctx.struct_ty(def_id, vec![])),
-                    TypeKind::Enum => Ok(self.ctx.enum_ty(def_id, vec![])),
-                    _ => {
-                        Err(Diagnostic::error("expected type, found something else")
-                            .with_span(*span))
+                } else {
+                    match path[0].as_str() {
+                        "Bool" => Ok(self.ctx.bool()),
+                        "Char" => Ok(self.ctx.char()),
+                        "Byte" => Ok(self.ctx.byte()),
+                        "USize" => Ok(self.ctx.usize()),
+                        "Unit" => Ok(self.ctx.unit()),
+                        "Never" => Ok(self.ctx.never()),
+                        _ => Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span)),
                     }
                 }
             }
@@ -1410,74 +1475,41 @@ impl<'a> TypeChecker<'a> {
                 if let Type::Path(path, _) = base.as_ref() {
                     if path.len() == 1 {
                         match path[0].as_str() {
-                            "Int" => {
-                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
-                                return Ok(self.ctx.int(bits, true));
-                            }
-                            "UInt" => {
-                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(32);
-                                return Ok(self.ctx.int(bits, false));
-                            }
-                            "Float" => {
-                                let bits = self.extract_int_from_type(&args[0]).unwrap_or(64);
-                                return Ok(self.ctx.float(bits));
-                            }
+                            "Int" => return Ok(self.ctx.int(self.extract_int_from_type(&args[0]).unwrap_or(32), true)),
+                            "UInt" => return Ok(self.ctx.int(self.extract_int_from_type(&args[0]).unwrap_or(32), false)),
+                            "Float" => return Ok(self.ctx.float(self.extract_int_from_type(&args[0]).unwrap_or(64))),
                             _ => {}
                         }
                     }
                 }
                 let base_ty = self.resolve_type(base)?;
-                let expanded_base = self.expand_base_type(base_ty, *span)?;
+                let expanded = self.expand_base_type(base_ty, *span)?;
                 let mut arg_tys = Vec::new();
-                for arg in args {
-                    arg_tys.push(self.resolve_type(arg)?);
-                }
-                match self.ctx.get(expanded_base) {
-                    TypeData::Struct { def_id, .. } => {
-                        let binding =
-                            self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| {
-                                Diagnostic::error("struct definition not found").with_span(*span)
-                            })?;
+                for arg in args { arg_tys.push(self.resolve_type(arg)?); }
+                match self.ctx.get(expanded) {
+                    TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => {
+                        let binding = self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| Diagnostic::error("type definition not found").with_span(*span))?;
                         if arg_tys.len() != binding.params.len() {
-                            return Err(Diagnostic::error(format!(
-                                "wrong number of type arguments: expected {}, got {}",
-                                binding.params.len(),
-                                arg_tys.len()
-                            ))
-                            .with_span(*span));
+                            return Err(Diagnostic::error(format!("wrong number of type arguments: expected {}, got {}", binding.params.len(), arg_tys.len())).with_span(*span));
                         }
-                        Ok(self.ctx.struct_ty(*def_id, arg_tys))
-                    }
-                    TypeData::Enum { def_id, .. } => {
-                        let binding =
-                            self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| {
-                                Diagnostic::error("enum definition not found").with_span(*span)
-                            })?;
-                        if arg_tys.len() != binding.params.len() {
-                            return Err(Diagnostic::error(format!(
-                                "wrong number of type arguments: expected {}, got {}",
-                                binding.params.len(),
-                                arg_tys.len()
-                            ))
-                            .with_span(*span));
+                        match binding.kind {
+                            TypeKind::Struct => Ok(self.ctx.struct_ty(*def_id, arg_tys)),
+                            TypeKind::Enum => Ok(self.ctx.enum_ty(*def_id, arg_tys)),
+                            _ => Err(Diagnostic::error("generic type arguments on non-generic type").with_span(*span)),
                         }
-                        Ok(self.ctx.enum_ty(*def_id, arg_tys))
                     }
-                    _ => Err(
-                        Diagnostic::error("generic type arguments on non-generic type")
-                            .with_span(*span),
-                    ),
+                    _ => Err(Diagnostic::error("generic type arguments on non-generic type").with_span(*span)),
                 }
             }
-            Type::Reference(ty, mutable, span) => {
+            Type::Reference(ty, mutable, _) => {
                 let inner = self.resolve_type(ty)?;
                 Ok(self.ctx.reference(inner, *mutable))
             }
-            Type::Pointer(ty, span) => {
+            Type::Pointer(ty, _) => {
                 let inner = self.resolve_type(ty)?;
                 Ok(self.ctx.pointer(inner))
             }
-            Type::Slice(ty, span) => {
+            Type::Slice(ty, _) => {
                 let inner = self.resolve_type(ty)?;
                 Ok(self.ctx.slice(inner))
             }
@@ -1486,87 +1518,45 @@ impl<'a> TypeChecker<'a> {
                 if let Expr::Literal(Literal::Int(size_val), _) = size.as_ref() {
                     Ok(self.ctx.array(inner, *size_val as u64))
                 } else {
-                    Err(
-                        Diagnostic::error("array size must be a compile-time constant integer")
-                            .with_span(*span),
-                    )
+                    Err(Diagnostic::error("array size must be a compile-time constant integer").with_span(*span))
                 }
             }
-            Type::Tuple(tys, span) => {
-                let mut elems = Vec::new();
-                for t in tys {
-                    elems.push(self.resolve_type(t)?);
-                }
+            Type::Tuple(tys, _) => {
+                let elems: Vec<_> = tys.iter().map(|t| self.resolve_type(t)).collect::<Result<_, _>>()?;
                 Ok(self.ctx.tuple(elems))
             }
-            Type::Function { params, ret, span } => {
-                let mut param_tys = Vec::new();
-                for p in params {
-                    param_tys.push(self.resolve_type(p)?);
-                }
+            Type::Function { params, ret, .. } => {
+                let param_tys: Vec<_> = params.iter().map(|p| self.resolve_type(p)).collect::<Result<_, _>>()?;
                 let ret_ty = self.resolve_type(ret)?;
                 Ok(self.ctx.function(param_tys, ret_ty))
             }
-            Type::Projection(base, name, span) => {
-                self.diagnostics.push(
-                    Diagnostic::error("type projections are not yet implemented").with_span(*span),
-                );
-                Ok(self.ctx.error())
-            }
-            Type::DynTrait(traits, span) => {
-                let mut trait_ids = Vec::new();
-                for t in traits {
-                    if let Type::Path(path, _) = t {
-                        if let Some(def_id) = self.resolve_def_id(path).ok() {
-                            trait_ids.push(def_id);
-                        }
-                    }
-                }
+            Type::Projection(_, _, span) => { self.diagnostics.push(Diagnostic::error("type projections are not yet implemented").with_span(*span)); Ok(self.ctx.error()) }
+            Type::DynTrait(traits, _) => {
+                let trait_ids: Vec<_> = traits.iter().filter_map(|t| if let Type::Path(p, _) = t { self.resolve_def_id(p).ok() } else { None }).collect();
                 Ok(self.ctx.dyn_trait(trait_ids))
             }
-            Type::Exists {
-                name,
-                base,
-                invariant,
-                span,
-            } => {
+            Type::Exists { name, base, invariant, span } => {
                 let base_ty = self.resolve_type(base)?;
-                let (inv_hir, inv_ty) = self.synthesize(invariant)?;
-                if !self.ctx.is_bool(inv_ty) {
-                    self.diagnostics
-                        .push(Diagnostic::error("invariant must be boolean").with_span(*span));
-                }
+                let (inv_hir, inv_ty) = self.infer_expr(invariant)?;
+                if !self.ctx.is_bool(inv_ty) { self.diagnostics.push(Diagnostic::error("invariant must be boolean").with_span(*span)); }
                 Ok(self.ctx.exists(name.clone(), base_ty, *invariant.clone()))
             }
-            Type::Literal(expr, span) => {
-                let (_, ty) = self.synthesize(expr)?;
-                Ok(ty)
-            }
-            Type::Never(span) => Ok(self.ctx.never()),
-            Type::Union(tys, span) => {
-                self.diagnostics.push(
-                    Diagnostic::error("union types are not yet implemented").with_span(*span),
-                );
-                Ok(self.ctx.error())
-            }
-            Type::Error(span) => Ok(self.ctx.error()),
+            Type::Literal(expr, _) => { let (_, ty) = self.infer_expr(expr)?; Ok(ty) }
+            Type::Never(_) => Ok(self.ctx.never()),
+            Type::Union(_, span) => { self.diagnostics.push(Diagnostic::error("union types are not yet implemented").with_span(*span)); Ok(self.ctx.error()) }
+            Type::Error(_) => Ok(self.ctx.error()),
         }
     }
 
     fn expand_base_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
         if let Some(def_id) = self.ctx.get_def_id_for_type(ty) {
-            let binding = self.symbols.lookup_type_by_def_id(def_id);
-            if let Some(binding) = binding {
+            if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
                 if binding.kind == TypeKind::Alias {
                     if self.resolving_aliases.contains(&def_id) {
                         return Err(Diagnostic::error("circular alias definition").with_span(span));
                     }
                     self.resolving_aliases.insert(def_id);
-                    let result = if let Some(ast) = &binding.alias_ast {
-                        self.resolve_type(ast)
-                    } else {
-                        Err(Diagnostic::error("alias has no body").with_span(span))
-                    };
+                    let result = binding.alias_ast.as_ref().map(|ast| self.resolve_type(ast)).unwrap_or(Err(Diagnostic::error("alias has no body").with_span(span)));
                     self.resolving_aliases.remove(&def_id);
                     return result;
                 }
@@ -1575,232 +1565,67 @@ impl<'a> TypeChecker<'a> {
         Ok(ty)
     }
 
-    fn resolve_type_to_struct_or_enum(
-        &self,
-        ty: TypeId,
-        span: Span,
-    ) -> Result<(DefId, Vec<TypeId>), Diagnostic> {
+    fn resolve_type_to_struct_or_enum(&self, ty: TypeId, span: Span) -> Result<(DefId, Vec<TypeId>), Diagnostic> {
         let resolved = self.ctx.resolve_binding(ty);
         match self.ctx.get(resolved) {
-            TypeData::Struct { def_id, args } | TypeData::Enum { def_id, args } => {
-                Ok((*def_id, args.clone()))
-            }
+            TypeData::Struct { def_id, args } | TypeData::Enum { def_id, args } => Ok((*def_id, args.clone())),
             TypeData::Error => Err(Diagnostic::error("type error").with_span(span)),
             _ => Err(Diagnostic::error("expected struct or enum type").with_span(span)),
         }
     }
 
     fn resolve_def_id(&self, path: &[String]) -> Result<DefId, Diagnostic> {
-        if path.is_empty() {
-            return Err(Diagnostic::error("empty path").with_span(Span::new(0, 0)));
-        }
-        let name = &path[0];
-        if let Some(binding) = self.symbols.lookup_type(name) {
-            if path.len() == 1 {
-                return Ok(binding.def_id);
-            }
-            Err(Diagnostic::error(format!(
-                "nested paths not supported yet: {}",
-                path.join("::")
-            ))
-            .with_span(Span::new(0, 0)))
-        } else {
-            Err(Diagnostic::error(format!("type '{}' not found", name)).with_span(Span::new(0, 0)))
-        }
+        if path.is_empty() { return Err(Diagnostic::error("empty path").with_span(Span::new(0, 0))); }
+        self.symbols.lookup_type(&path[0]).map(|b| b.def_id).ok_or_else(|| Diagnostic::error(format!("type '{}' not found", path[0])).with_span(Span::new(0, 0)))
     }
 
     fn unify(&mut self, expected: TypeId, actual: TypeId, span: Span) -> Result<(), Diagnostic> {
-        match self.ctx.unify(expected, actual) {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Diagnostic::error(format!(
-                "type mismatch: expected {:?}, found {:?}",
-                self.ctx.get(expected),
-                self.ctx.get(actual)
-            ))
-            .with_span(span)),
-        }
+        self.ctx.unify(expected, actual).map(|_| ()).map_err(|_err| Diagnostic::error(format!("type mismatch: expected {:?}, found {:?}", self.ctx.get(expected), self.ctx.get(actual))).with_span(span))
     }
 
-    fn binary_op_type(
-        &mut self,
-        op: BinOp,
-        left: TypeId,
-        right: TypeId,
-        span: Span,
-    ) -> Result<TypeId, Diagnostic> {
+    fn binary_op_type(&mut self, op: BinOp, left: TypeId, right: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
+        self.unify(left, right, span)?;
         match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                self.unify(left, right, span)?;
-                if self.ctx.is_numeric(left) {
-                    Ok(left)
-                } else {
-                    Err(
-                        Diagnostic::error("arithmetic operators require numeric types")
-                            .with_span(span),
-                    )
-                }
-            }
-            BinOp::AddWrap
-            | BinOp::SubWrap
-            | BinOp::MulWrap
-            | BinOp::AddSaturate
-            | BinOp::SubSaturate
-            | BinOp::MulSaturate
-            | BinOp::AddTrap
-            | BinOp::SubTrap
-            | BinOp::MulTrap => {
-                self.unify(left, right, span)?;
-                if self.ctx.is_integer(left) {
-                    Ok(left)
-                } else {
-                    Err(Diagnostic::error(
-                        "wrapping/saturating/trapping operators require integer types",
-                    )
-                    .with_span(span))
-                }
-            }
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-                self.unify(left, right, span)?;
-                if self.ctx.is_integer(left) {
-                    Ok(left)
-                } else {
-                    Err(Diagnostic::error("bitwise operators require integer types")
-                        .with_span(span))
-                }
-            }
-            BinOp::Eq | BinOp::Neq => {
-                self.unify(left, right, span)?;
-                Ok(self.ctx.bool())
-            }
-            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-                self.unify(left, right, span)?;
-                if self.ctx.is_numeric(left) {
-                    Ok(self.ctx.bool())
-                } else {
-                    Err(
-                        Diagnostic::error("comparison operators require numeric types")
-                            .with_span(span),
-                    )
-                }
-            }
-            BinOp::And | BinOp::Or => {
-                if !self.ctx.is_bool(left) {
-                    Err(Diagnostic::error("logical operators require boolean types")
-                        .with_span(span))
-                } else {
-                    self.unify(left, right, span)?;
-                    Ok(self.ctx.bool())
-                }
-            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem if self.ctx.is_numeric(left) => Ok(left),
+            BinOp::AddWrap | BinOp::SubWrap | BinOp::MulWrap | BinOp::AddSaturate | BinOp::SubSaturate | BinOp::MulSaturate | BinOp::AddTrap | BinOp::SubTrap | BinOp::MulTrap if self.ctx.is_integer(left) => Ok(left),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr if self.ctx.is_integer(left) => Ok(left),
+            BinOp::Eq | BinOp::Neq => Ok(self.ctx.bool()),
+            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge if self.ctx.is_numeric(left) => Ok(self.ctx.bool()),
+            BinOp::And | BinOp::Or if self.ctx.is_bool(left) => { self.unify(left, right, span)?; Ok(self.ctx.bool()) }
+            _ => Err(Diagnostic::error("invalid operands for binary operator").with_span(span)),
         }
     }
 
-    fn unary_op_type(&mut self, op: UnaryOp, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
-        match op {
-            UnaryOp::Neg => {
-                if self.ctx.is_numeric(ty) {
-                    Ok(ty)
-                } else {
-                    Err(Diagnostic::error("negation requires numeric type").with_span(span))
-                }
-            }
-            UnaryOp::Not => {
-                if self.ctx.is_bool(ty) {
-                    Ok(self.ctx.bool())
-                } else {
-                    Err(Diagnostic::error("logical not requires boolean type").with_span(span))
-                }
-            }
-            UnaryOp::BitNot => {
-                if self.ctx.is_integer(ty) {
-                    Ok(ty)
-                } else {
-                    Err(Diagnostic::error("bitwise not requires integer type").with_span(span))
-                }
-            }
-            UnaryOp::Deref => {
-                if let Some(pointee) = self.ctx.pointee_of_ref(ty) {
-                    Ok(pointee)
-                } else if let Some(pointee) = self.ctx.pointee_of_pointer(ty) {
-                    Ok(pointee)
-                } else {
-                    Err(
-                        Diagnostic::error("dereference requires reference or pointer type")
-                            .with_span(span),
-                    )
-                }
-            }
-            UnaryOp::Ref | UnaryOp::RefMut => {
-                let mutable = matches!(op, UnaryOp::RefMut);
-                Ok(self.ctx.reference(ty, mutable))
-            }
-        }
-    }
-
-    fn check_cast(
-        &mut self,
-        from: TypeId,
-        to: TypeId,
-        safe: bool,
-        span: Span,
-    ) -> Result<TypeId, Diagnostic> {
+    fn check_cast(&mut self, from: TypeId, to: TypeId, safe: bool, span: Span) -> Result<TypeId, Diagnostic> {
         if safe {
-            if self.ctx.is_numeric(from) && self.ctx.is_numeric(to) {
-                Ok(to)
-            } else if self.ctx.is_bool(from) && self.ctx.is_integer(to) {
-                Ok(to)
-            } else if self.ctx.is_integer(from) && self.ctx.is_bool(to) {
+            if (self.ctx.is_numeric(from) && self.ctx.is_numeric(to)) || (self.ctx.is_bool(from) && self.ctx.is_integer(to)) || (self.ctx.is_integer(from) && self.ctx.is_bool(to)) {
                 Ok(to)
             } else {
-                Err(
-                    Diagnostic::error("safe cast only allowed between numeric and boolean types")
-                        .with_span(span),
-                )
+                Err(Diagnostic::error("safe cast only allowed between numeric and boolean types").with_span(span))
             }
         } else {
-            if self.ctx.is_numeric(from) && self.ctx.is_numeric(to) {
+            if (self.ctx.is_numeric(from) && self.ctx.is_numeric(to)) || (self.ctx.is_reference(from) && self.ctx.is_pointer(to)) || (self.ctx.is_pointer(from) && self.ctx.is_reference(to)) {
                 Ok(to)
-            } else if self.ctx.is_reference(from) && self.ctx.is_pointer(to) {
+            } else if let (TypeData::Ptr { .. }, TypeData::Ptr { .. }) = (self.ctx.get(from), self.ctx.get(to)) {
                 Ok(to)
-            } else if self.ctx.is_pointer(from) && self.ctx.is_reference(to) {
-                Ok(to)
-            } else if let TypeData::Ptr { .. } = self.ctx.get(from) {
-                if let TypeData::Ptr { .. } = self.ctx.get(to) {
-                    Ok(to)
-                } else {
-                    Err(
-                        Diagnostic::error("bitcast requires compatible pointer/ref types")
-                            .with_span(span),
-                    )
-                }
             } else {
                 Err(Diagnostic::error("unsafe cast requires compatible types").with_span(span))
             }
         }
     }
 
-    fn check_result_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
-        if let Some(ok_ty) = self.extract_ok_type(ty) {
-            Ok(ok_ty)
-        } else {
-            Err(Diagnostic::error("try operator requires Result type").with_span(span))
-        }
+    fn check_result_type(&self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
+        if let Some(ok_ty) = self.extract_ok_type(ty) { Ok(ok_ty) } else { Err(Diagnostic::error("try operator requires Result type").with_span(span)) }
     }
 
-    fn check_future_type(&mut self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
-        if let Some(future_ty) = self.extract_future_type(ty) {
-            Ok(future_ty)
-        } else {
-            Err(Diagnostic::error("await operator requires Future type").with_span(span))
-        }
+    fn check_future_type(&self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
+        if let Some(future_ty) = self.extract_future_type(ty) { Ok(future_ty) } else { Err(Diagnostic::error("await operator requires Future type").with_span(span)) }
     }
 
     fn extract_ok_type(&self, ty: TypeId) -> Option<TypeId> {
         if let TypeData::Enum { def_id: did, args } = self.ctx.get(ty) {
             if let Some(result_id) = self.known_def_id("Result") {
-                if *did == result_id && args.len() == 2 {
-                    return Some(args[0]);
-                }
+                if *did == result_id && args.len() == 2 { return Some(args[0]); }
             }
         }
         None
@@ -1809,9 +1634,7 @@ impl<'a> TypeChecker<'a> {
     fn extract_future_type(&self, ty: TypeId) -> Option<TypeId> {
         if let TypeData::Enum { def_id: did, args } = self.ctx.get(ty) {
             if let Some(future_id) = self.known_def_id("Future") {
-                if *did == future_id && args.len() == 1 {
-                    return Some(args[0]);
-                }
+                if *did == future_id && args.len() == 1 { return Some(args[0]); }
             }
         }
         None
@@ -1820,82 +1643,195 @@ impl<'a> TypeChecker<'a> {
     fn extract_result_types(&self, ty: TypeId, span: Span) -> Result<(TypeId, TypeId), Diagnostic> {
         if let TypeData::Enum { def_id: did, args } = self.ctx.get(ty) {
             if let Some(result_id) = self.known_def_id("Result") {
-                if *did == result_id && args.len() == 2 {
-                    return Ok((args[0], args[1]));
-                }
+                if *did == result_id && args.len() == 2 { return Ok((args[0], args[1])); }
             }
         }
         Err(Diagnostic::error("catch requires Result type").with_span(span))
     }
 
-    fn known_def_id(&self, name: &str) -> Option<DefId> {
-        self.symbols.lookup_type(name).map(|b| b.def_id)
+    fn known_def_id(&self, name: &str) -> Option<DefId> { self.symbols.lookup_type(name).map(|b| b.def_id) }
+
+    /// Attempt to dereference a type once using built-in rules.
+    /// Handles `&T` / `&mut T`, `*T`, `Ptr<pointee = T>`, and known wrapper types.
+    fn builtin_deref_ty(&self, ty: TypeId) -> Option<TypeId> {
+        // Direct reference/pointer deref
+        if let Some(inner) = self.ctx.pointee_of_ref(ty) {
+            return Some(inner);
+        }
+        if let Some(inner) = self.ctx.pointee_of_pointer(ty) {
+            return Some(inner);
+        }
+        // Ptr<pointee = T> deref
+        if let TypeData::Ptr { pointee, .. } = self.ctx.get(ty) {
+            return Some(*pointee);
+        }
+        // For Box<T>, Rc<T> etc: if it's a Struct with a single generic arg and
+        // we can find a Deref impl, deref through that. For now, hardcode Box/Rc
+        // lookup via known_def_id and check for single-arg structs.
+        if let TypeData::Struct { def_id, args } = self.ctx.get(ty) {
+            if args.len() == 1 {
+                if let Some(binding) = self.symbols.lookup_type_by_def_id(*def_id) {
+                    // If the name contains "Box" or "Rc" we try deref through the type arg
+                    let name = binding.def_id; // positional, not a great check — fallback: try the first arg
+                    // In a full implementation we'd look for a Deref impl in trait_env.
+                    // For now, just unwrap one layer for single-arg "smart pointer" structs
+                    // that have a field named "ptr" or "inner" of the parameter type.
+                    // Simpler heuristic: if it's a struct wrapping one generic param,
+                    // the only field likely holds the inner value.
+                    if let Some(field) = binding.fields.first() {
+                let field_ty = self.ctx.subst(field.ty, &Subst::new());
+                // If the field type is just the generic param, return args[0]
+                        if let TypeData::GenericParam { .. } = self.ctx.get(field_ty) {
+                            return Some(args[0]);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Walk the autoderef chain up to MAX_DEREFS steps, yielding each intermediate type.
+    fn autoderef_chain<'s>(&'s self, ty: TypeId) -> AutoderefIter<'s> {
+        AutoderefIter {
+            checker: self,
+            current: Some(ty),
+            depth: 0,
+            max_depth: 10,
+        }
     }
 
     fn lookup_field(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
+        // Collect field names from all types in the deref chain for error reporting
+        let mut all_field_names: Vec<String> = Vec::new();
+
+        // Try direct lookup first
         if let TypeData::Struct { def_id, args } = self.ctx.get(ty) {
-            let binding = self
-                .symbols
-                .lookup_type_by_def_id(*def_id)
-                .ok_or_else(|| Diagnostic::error("struct definition not found").with_span(span))?;
-            let field = binding
-                .fields
-                .iter()
-                .find(|f| f.name == name)
-                .ok_or_else(|| {
-                    Diagnostic::error(format!("field '{}' not found", name)).with_span(span)
-                })?;
-            let mut subst = Subst::new();
-            for (i, param) in binding.params.iter().enumerate() {
-                if let Some(&arg) = args.get(i) {
-                    subst.insert(i, arg);
+            let binding = self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| Diagnostic::error("struct definition not found").with_span(span))?;
+            all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
+            if let Some(field) = binding.fields.iter().find(|f| f.name == name) {
+                let mut subst = Subst::new();
+                for (i, _param) in binding.params.iter().enumerate() { if let Some(&arg) = args.get(i) { subst.insert(i, arg); } }
+                return Ok(self.ctx.subst(field.ty, &subst));
+            }
+        }
+
+        // Walk autoderef chain, skipping the original type (already tried)
+        for deref_ty in self.autoderef_chain(ty).skip(1) {
+            if let TypeData::Struct { def_id, args } = self.ctx.get(deref_ty) {
+                let binding = self.symbols.lookup_type_by_def_id(*def_id).ok_or_else(|| Diagnostic::error("struct definition not found").with_span(span))?;
+                all_field_names.extend(binding.fields.iter().map(|f| f.name.clone()));
+                if let Some(field) = binding.fields.iter().find(|f| f.name == name) {
+                    let mut subst = Subst::new();
+                    for (i, _param) in binding.params.iter().enumerate() { if let Some(&arg) = args.get(i) { subst.insert(i, arg); } }
+                    return Ok(self.ctx.subst(field.ty, &subst));
                 }
             }
-            let field_ty = self.ctx.subst(field.ty, &subst);
-            Ok(field_ty)
-        } else {
-            Err(Diagnostic::error("field access on non-struct type").with_span(span))
         }
+
+        // Build an informative error message
+        let mut diag = Diagnostic::error(format!("no field `{}` found on type", name))
+            .with_code("E010")
+            .with_span(span);
+
+        if !all_field_names.is_empty() {
+            diag = diag.with_suggestion(format!("available fields: {}", all_field_names.join(", ")));
+            if let Some(suggestion) = did_you_mean_suggestion(name, &all_field_names) {
+                diag = diag.with_suggestion(suggestion);
+            }
+        }
+
+        Err(diag)
+    }
+
+    /// Look up a method by name on a type, walking the autoderef chain.
+    /// Returns `(param_types, return_type)` if found.
+    fn lookup_method(&mut self, ty: TypeId, name: &str) -> Option<(Vec<TypeId>, TypeId)> {
+        for current_ty in self.autoderef_chain(ty) {
+            // Check inherent methods first (registered via `impl Type { ... }`)
+            for method in self.trait_env.lookup_inherent_methods(current_ty, self.ctx) {
+                if method.name == name {
+                    return Some((method.param_tys.clone(), method.ret_ty));
+                }
+            }
+
+            // Collect trait impl methods with matching name, then resolve types
+            // outside the borrow of self.trait_env.
+            let mut pending: Vec<(Vec<crate::ast::Param>, crate::ast::Type)> = Vec::new();
+            for cand in self.trait_env.lookup_impls_for_type(current_ty) {
+                for method in &cand.methods {
+                    if method.name == name {
+                        pending.push((method.params.clone(), method.return_type.clone()));
+                    }
+                }
+            }
+            for (params, return_type) in pending {
+                let mut param_tys = Vec::with_capacity(params.len());
+                for p in &params {
+                    if let Some(ref param_ty) = p.ty {
+                        match self.resolve_type(param_ty) {
+                            Ok(ty_id) => param_tys.push(ty_id),
+                            Err(_) => return None,
+                        }
+                    } else {
+                        param_tys.push(self.ctx.error());
+                    }
+                }
+                let ret_ty = self.resolve_type(&return_type).ok()?;
+                return Some((param_tys, ret_ty));
+            }
+        }
+        None
     }
 
     fn lookup_attr(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
         match name {
-            "len" => {
-                if self.ctx.is_array(ty) || self.ctx.is_slice(ty) {
-                    Ok(self.ctx.usize())
-                } else {
-                    Err(
-                        Diagnostic::error("'len attribute requires array or slice type")
-                            .with_span(span),
-                    )
-                }
-            }
-            "size" => {
-                if self.ctx.is_integer(ty) || self.ctx.is_float(ty) || self.ctx.is_pointer(ty) {
-                    Ok(self.ctx.usize())
-                } else {
-                    Err(Diagnostic::error(
-                        "'size attribute requires integer, float, or pointer type",
-                    )
-                    .with_span(span))
-                }
-            }
+            "len" if self.ctx.is_array(ty) || self.ctx.is_slice(ty) => Ok(self.ctx.usize()),
+            "size" if self.ctx.is_integer(ty) || self.ctx.is_float(ty) || self.ctx.is_pointer(ty) => Ok(self.ctx.usize()),
             "align" => Ok(self.ctx.usize()),
             "default" => Ok(ty),
             _ => Err(Diagnostic::error(format!("unknown attribute '{}'", name)).with_span(span)),
         }
     }
 
+    fn lookup_type_default_expr(&mut self, ty_id: TypeId, span: Span) -> Result<Option<Expr>, Diagnostic> {
+        let resolved = self.ctx.resolve_binding(ty_id);
+        let def_id = match self.ctx.get(resolved) {
+            TypeData::Struct { def_id, .. } | TypeData::Enum { def_id, .. } => Some(*def_id),
+            _ => None,
+        };
+        if let Some(def_id) = def_id {
+            if let Some(binding) = self.symbols.lookup_type_by_def_id(def_id) {
+                if binding.no_default {
+                    self.diagnostics.push(
+                        Diagnostic::error("type forbids implicit initialization (no_default)")
+                            .with_span(span)
+                    );
+                    return Ok(None);
+                }
+                if let Some(ref default_expr) = binding.default_value {
+                    return Ok(Some(default_expr.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn block_type(&self, stmts: &[HirStmt]) -> TypeId {
         for stmt in stmts.iter().rev() {
-            if let HirStmt::Expression(expr) = stmt {
-                return expr.ty();
-            }
-            if let HirStmt::Return { value, .. } = stmt {
-                if let Some(value) = value {
-                    return value.ty();
+            match stmt {
+                HirStmt::Expression(expr) => {
+                    if !matches!(expr.as_ref(), HirExpr::Error(_)) {
+                        return expr.ty();
+                    }
                 }
-                return self.ctx.never();
+                HirStmt::Return { value: Some(value), .. } => {
+                    if !matches!(value.as_ref(), HirExpr::Error(_)) {
+                        return value.ty();
+                    }
+                }
+                HirStmt::Return { value: None, .. } => return self.ctx.never(),
+                _ => {}
             }
         }
         self.ctx.unit()
@@ -1903,52 +1839,184 @@ impl<'a> TypeChecker<'a> {
 
     fn get_trait_id_for_binop(&self, op: BinOp, span: Span) -> Result<Option<DefId>, Diagnostic> {
         let trait_name = match op {
-            BinOp::Add => "Add",
-            BinOp::Sub => "Sub",
-            BinOp::Mul => "Mul",
-            BinOp::Div => "Div",
-            BinOp::Rem => "Rem",
-            BinOp::BitAnd => "BitAnd",
-            BinOp::BitOr => "BitOr",
-            BinOp::BitXor => "BitXor",
-            BinOp::Shl => "Shl",
-            BinOp::Shr => "Shr",
-            BinOp::Eq => "Eq",
-            BinOp::Neq => "Neq",
-            BinOp::Lt => "Lt",
-            BinOp::Gt => "Gt",
-            BinOp::Le => "Le",
-            BinOp::Ge => "Ge",
-            BinOp::And => "And",
-            BinOp::Or => "Or",
-            _ => {
-                return Err(
-                    Diagnostic::error("overflow operators not yet supported via traits")
-                        .with_span(span),
-                );
-            }
+            BinOp::Add => "Add", BinOp::Sub => "Sub", BinOp::Mul => "Mul", BinOp::Div => "Div", BinOp::Rem => "Rem",
+            BinOp::BitAnd => "BitAnd", BinOp::BitOr => "BitOr", BinOp::BitXor => "BitXor", BinOp::Shl => "Shl", BinOp::Shr => "Shr",
+            BinOp::Eq => "Eq", BinOp::Neq => "Neq", BinOp::Lt => "Lt", BinOp::Gt => "Gt", BinOp::Le => "Le", BinOp::Ge => "Ge",
+            BinOp::And => "And", BinOp::Or => "Or",
+            _ => return Err(Diagnostic::error("overflow operators not yet supported via traits").with_span(span)),
         };
         Ok(self.symbols.lookup_trait(trait_name).map(|b| b.def_id))
     }
 
     fn extract_int_from_type(&self, ty: &Type) -> Option<u8> {
-        match ty {
-            Type::Literal(expr, _) => {
-                if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() {
-                    Some(*val as u8)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        if let Type::Literal(expr, _) = ty {
+            if let Expr::Literal(Literal::Int(val), _) = expr.as_ref() { return Some(*val as u8); }
         }
+        None
     }
 
-    fn new_infer_var(&mut self, kind: TypeVariableKind) -> TypeId {
-        self.infer.new_type_var(self.ctx, kind)
+    fn new_infer_var(&mut self, kind: TypeVariableKind) -> TypeId { self.infer.new_type_var(self.ctx, kind) }
+    fn add_constraint(&mut self, c: Constraint) { self.infer.add_constraint(c); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::builtins;
+    use crate::hir::resolver::NameResolver;
+    use crate::parser::Parser;
+
+    /// Run the full pipeline (parse → resolve → builtins → type-check) on Posita source.
+    fn check_source(source: &str) -> Result<HirProgram, Vec<String>> {
+        let mut parser = Parser::new(source);
+        let program = parser.parse_program().map_err(|diags| {
+            diags.into_iter().map(|d| d.message).collect::<Vec<_>>()
+        })?;
+
+        let mut ctx = TypeContext::new();
+        let local_crate_id = CrateId(DefId(0));
+        let mut resolver = NameResolver::new(&mut ctx, local_crate_id);
+        let (mut symbols, mut trait_env, _res_diags) = resolver
+            .resolve_program(&program)
+            .map_err(|diags| diags.into_inner().into_iter().map(|d| d.message).collect::<Vec<_>>())?;
+
+        builtins::register_builtins(&mut symbols, &mut trait_env, &mut ctx);
+
+        let mut checker = TypeChecker::new(&mut ctx, &symbols, &mut trait_env);
+        checker
+            .check_program(&program)
+            .map_err(|diags| diags.into_inner().into_iter().map(|d| d.message).collect::<Vec<_>>())
     }
 
-    fn add_constraint(&mut self, c: Constraint) {
-        self.infer.add_constraint(c);
+    #[test]
+    fn test_simple_field_access() {
+        let result = check_source(
+            "type Point = struct { x: Int<32>, y: Int<32> }
+             def main() -> Int<32> {
+                 set p = Point { x = 10, y = 20 };
+                 return p.x;
+             }",
+        );
+        assert!(result.is_ok(), "field access should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_field_access_through_ref() {
+        let result = check_source(
+            "type Point = struct { x: Int<32>, y: Int<32> }
+             def main() -> Int<32> {
+                 set p = Point { x = 10, y = 20 };
+                 set mut r = &p;
+                 return r.x;
+             }",
+        );
+        assert!(result.is_ok(), "field access through ref should succeed via autoderef: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_missing_field_error() {
+        let result = check_source(
+            "type Point = struct { x: Int<32>, y: Int<32> }
+             def main() -> Int<32> {
+                 set p = Point { x = 10, y = 20 };
+                 return p.z;
+             }",
+        );
+        assert!(result.is_err(), "missing field should produce an error");
+        let errors = result.err().unwrap();
+        let all = errors.join(" ");
+        assert!(all.contains("no field"), "error should mention 'no field': {}", all);
+    }
+
+    #[test]
+    fn test_method_call() {
+        // Define a struct with an impl block containing a method
+        let result = check_source(
+            "type MyType = struct { val: Int<32> }
+             impl for MyType {
+                 def get_val(&self) -> Int<32> {
+                     return self.val;
+                 }
+             }
+             def main() -> Int<32> {
+                 set obj = MyType { val = 42 };
+                 return obj.get_val();
+             }",
+        );
+        assert!(result.is_ok(), "method call should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_missing_method_error() {
+        let result = check_source(
+            "type MyType = struct { val: Int<32> }
+             impl for MyType {
+                 def get_val(&self) -> Int<32> {
+                     return self.val;
+                 }
+             }
+             def main() -> Int<32> {
+                 set obj = MyType { val = 42 };
+                 return obj.nonexistent();
+             }",
+        );
+        assert!(result.is_err(), "missing method should produce an error");
+        let errors = result.err().unwrap();
+        let all = errors.join(" ");
+        assert!(all.contains("no method"), "error should mention 'no method': {}", all);
+    }
+
+    #[test]
+    fn test_autoderef_method_call() {
+        let result = check_source(
+            "type MyType = struct { val: Int<32> }
+             impl for MyType {
+                 def get_val(&self) -> Int<32> {
+                     return self.val;
+                 }
+             }
+             def main() -> Int<32> {
+                 set obj = MyType { val = 42 };
+                 set r = &obj;
+                 return r.get_val();
+             }",
+        );
+        assert!(
+            result.is_ok(),
+            "method call through ref should succeed via autoderef: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_field_access_on_non_struct_error() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                 set x = 42;
+                 return x.nonexistent;
+             }",
+        );
+        assert!(result.is_err(), "field access on non-struct should error");
+        let errors = result.err().unwrap();
+        let all = errors.join(" ");
+        assert!(
+            all.contains("no field") || all.contains("field"),
+            "error should mention field: {}",
+            all
+        );
+    }
+
+    #[test]
+    fn test_compiles_simple_program() {
+        let result = check_source(
+            "
+            def add(a: Int<32>, b: Int<32>) -> Int<32> {
+                return a + b;
+            }
+            def main() -> Int<32> {
+                return add(1, 2);
+            }",
+        );
+        assert!(result.is_ok(), "simple program should type-check: {:?}", result.err());
     }
 }
