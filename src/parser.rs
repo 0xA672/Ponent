@@ -486,9 +486,11 @@ impl<'source> Parser<'source> {
         ) {
             contracts.push(self.parse_contract()?);
         }
-        if matches!(self.peek(), Ok(Token::Where)) {
-            self.parse_where_clause()?;
-        }
+        let where_clause = if matches!(self.peek(), Ok(Token::Where)) {
+            Some(self.parse_where_clause()?)
+        } else {
+            None
+        };
         self.expect(Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(Token::RBrace)?;
@@ -512,7 +514,7 @@ impl<'source> Parser<'source> {
             return_type,
             body: Some(body),
             type_params,
-            where_clause: None,
+            where_clause,
             finally,
             is_comptime,
             is_async,
@@ -720,24 +722,33 @@ impl<'source> Parser<'source> {
         Ok(p)
     }
 
-    fn parse_where_clause(&mut self) -> Result<(), Diagnostic> {
-        self.advance().ok();
+    fn parse_where_clause(&mut self) -> Result<WhereClause, Diagnostic> {
+        let start = self.span().start;
+        self.advance().ok(); // consume 'where'
+        let mut predicates = Vec::new();
         loop {
-            self.parse_type()?;
+            let ty = self.parse_type()?;
             self.expect(Token::Colon)?;
+            let mut bounds = Vec::new();
             loop {
-                self.parse_type()?;
+                bounds.push(self.parse_type()?);
                 if !matches!(self.peek(), Ok(Token::Plus)) {
                     break;
                 }
                 self.advance().ok();
             }
+            let end = self.span().end;
+            predicates.push(WherePredicate {
+                ty,
+                bounds,
+                span: Span::new(start, end),
+            });
             if !matches!(self.peek(), Ok(Token::Comma)) {
                 break;
             }
             self.advance().ok();
         }
-        Ok(())
+        Ok(WhereClause { predicates })
     }
 
     fn parse_param(&mut self) -> Result<Param, Diagnostic> {
@@ -2194,9 +2205,14 @@ impl<'source> Parser<'source> {
     fn parse_impl_block(&mut self, attributes: Vec<Attribute>) -> Result<Stmt, Diagnostic> {
         let start = self.span().start;
         self.advance().ok();
-        // Inherent impl: `impl TypeName { ... }`
-        // Trait impl:   `impl TraitName for TypeName { ... }`
+        // Inherent impl: `impl TypeName { ... }` or `impl<T> TypeName { ... }`
+        // Trait impl:   `impl TraitName for TypeName { ... }` or `impl<T> TraitName for TypeName { ... }`
         // Check if the next token is `for` → inherent impl
+        let type_params = if matches!(self.peek(), Ok(Token::Lt)) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
         let trait_path = if matches!(self.peek(), Ok(Token::For)) {
             self.advance().ok(); // consume `for`
             None
@@ -2229,6 +2245,11 @@ impl<'source> Parser<'source> {
             None
         };
         let for_type = self.parse_type()?;
+        let where_clause = if matches!(self.peek(), Ok(Token::Where)) {
+            Some(self.parse_where_clause()?)
+        } else {
+            None
+        };
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
         loop {
@@ -2245,6 +2266,8 @@ impl<'source> Parser<'source> {
             trait_path,
             for_type,
             methods,
+            where_clause,
+            type_params,
         })
     }
 

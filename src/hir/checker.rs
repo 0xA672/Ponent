@@ -142,6 +142,9 @@ pub struct TypeChecker<'a> {
     /// Locaw cache of variabwe types, updated by check_stmt for each VawiabweDef.
     /// Ovewwides the wesowvew's pwacehowdew `ewrow` type. (◕‿◕)
     local_variable_types: HashMap<String, TypeId>,
+    /// Local cache of generic type parameter types (e.g. `T` in `def foo<T>(x: T)`).
+    /// Populated when processing function definitions with type_params.
+    local_type_param_cache: HashMap<String, TypeId>,
 }
 
 struct ScopeGuard<'a, 'tcx> {
@@ -191,6 +194,7 @@ impl<'a> TypeChecker<'a> {
             infer_stack: Vec::new(),
             loop_stack: vec![CtxFrame { kind: CtxKind::Function, span: Span::new(0, 0), label: None }],
             local_variable_types: HashMap::new(),
+            local_type_param_cache: HashMap::new(),
         }
     }
 
@@ -201,7 +205,7 @@ impl<'a> TypeChecker<'a> {
 
     fn exit_inference_scope(&mut self) -> Result<(), DiagnosticCollector> {
         let mut current = mem::replace(&mut self.infer, self.infer_stack.pop().unwrap_or_default());
-        if let Err(err) = current.solve(self.ctx, self.trait_env) {
+        if let Err(err) = current.solve(self.ctx, self.trait_env, self.symbols) {
             let diag = Diagnostic::error(format!("type inference error: {:?}", err))
                 .with_span(Span::new(0, 0));
             self.diagnostics.push(diag);
@@ -436,6 +440,13 @@ impl<'a> TypeChecker<'a> {
                     });
                 }
 
+                // Register generic type parameters so that `T` in where clauses
+                // and function bodies can be resolved.
+                for (i, tp) in type_params.iter().enumerate() {
+                    let generic_id = self.ctx.generic_param(i, tp.name.clone());
+                    self.local_type_param_cache.insert(tp.name.clone(), generic_id);
+                }
+
                 let guard = ScopeGuard::new(self);
                 guard.checker.current_function = Some(DefId(0));
                 guard.checker.current_return_type = Some(return_ty);
@@ -445,6 +456,19 @@ impl<'a> TypeChecker<'a> {
                 // since the resolver already popped the parameter scope.
                 for p in &hir_params {
                     guard.checker.local_variable_types.insert(p.name.clone(), p.ty);
+                }
+
+                // Generate where-clause constraints as Impl(clause_ty, trait_id)
+                // so the solver can verify trait bounds on generic parameters.
+                if let Some(wc) = where_clause {
+                    for pred in &wc.predicates {
+                        let pred_ty = guard.checker.resolve_type(&pred.ty)?;
+                        for bound in &pred.bounds {
+                            if let Some(trait_id) = guard.checker.resolve_trait_path(bound) {
+                                guard.checker.add_constraint(Constraint::Impl(pred_ty, trait_id, pred.span));
+                            }
+                        }
+                    }
                 }
 
                 let body_result = if let Some(body) = body {
@@ -763,21 +787,25 @@ impl<'a> TypeChecker<'a> {
                 // Edition declarations are handled by the parser; skip silently.
                 Ok(HirStmt::Error)
             }
-            Stmt::TraitDef { .. } | Stmt::Import { .. }
+            Stmt::TraitDef { .. } => {
+                // Trait definitions are handled by the resolver; skip silently.
+                Ok(HirStmt::Error)
+            }
+            Stmt::Import { .. }
             | Stmt::ExternFunction { .. } | Stmt::Constraint { .. } => {
                 self.diagnostics.push(Diagnostic::error("top-level item not yet supported in type checker").with_span(stmt.span()));
                 Ok(HirStmt::Error)
             }
             Stmt::ImplBlock { .. } => {
                 let (trait_path, for_type, methods, span, attributes) = match stmt {
-                    Stmt::ImplBlock { span, trait_path, for_type, methods, attributes } => {
+                    Stmt::ImplBlock { span, trait_path, for_type, methods, attributes, .. } => {
                         (trait_path, for_type, methods, *span, attributes)
                     }
                     _ => unreachable!(),
                 };
                 if trait_path.is_some() {
-                    // Trait impl blocks are not yet supported — defer for later
-                    self.diagnostics.push(Diagnostic::error("trait impl blocks not yet supported in type checker").with_span(span));
+                    // Trait impl blocks are already handled by the resolver;
+                    // no additional checking needed here.
                     Ok(HirStmt::Error)
                 } else {
                     // Inherent impl block: resolve the type and register methods
@@ -1491,6 +1519,15 @@ impl<'a> TypeChecker<'a> {
         match ty {
             Type::Path(path, span) => {
                 if let Ok(def_id) = self.resolve_def_id(path) {
+                    // Check if this is a generic type parameter (sentinel from resolve_def_id)
+                    if def_id == DefId(usize::MAX - 1) {
+                        if path.len() == 1 {
+                            if let Some(&ty) = self.local_type_param_cache.get(&path[0]) {
+                                return Ok(ty);
+                            }
+                        }
+                        return Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span));
+                    }
                     let binding = self.symbols.lookup_type_by_def_id(def_id).ok_or_else(|| Diagnostic::error(format!("type not found: {:?}", path)).with_span(*span))?;
                     match binding.kind {
                         TypeKind::Alias => {
@@ -1532,7 +1569,15 @@ impl<'a> TypeChecker<'a> {
                         "USize" => Ok(self.ctx.usize()),
                         "Unit" => Ok(self.ctx.unit()),
                         "Never" => Ok(self.ctx.never()),
-                        _ => Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span)),
+                        _ => {
+                            // Check if this is a generic type parameter registered in the local cache
+                            if path.len() == 1 {
+                                if let Some(&ty) = self.local_type_param_cache.get(&path[0]) {
+                                    return Ok(ty);
+                                }
+                            }
+                            Err(Diagnostic::error(format!("type '{}' not found", path[0])).with_span(*span))
+                        }
                     }
                 }
             }
@@ -1641,6 +1686,14 @@ impl<'a> TypeChecker<'a> {
 
     fn resolve_def_id(&self, path: &[String]) -> Result<DefId, Diagnostic> {
         if path.is_empty() { return Err(Diagnostic::error("empty path").with_span(Span::new(0, 0))); }
+        // Check if this is a generic type parameter (e.g. `T` in `def foo<T>(x: T)`)
+        if path.len() == 1 {
+            if self.local_type_param_cache.contains_key(&path[0]) {
+                // Return a sentinel DefId to signal "this is a generic param, not a concrete type"
+                // The caller (resolve_type) will handle this by looking up local_type_param_cache.
+                return Ok(DefId(usize::MAX - 1));
+            }
+        }
         self.symbols.lookup_type(&path[0]).map(|b| b.def_id).ok_or_else(|| Diagnostic::error(format!("type '{}' not found", path[0])).with_span(Span::new(0, 0)))
     }
 
@@ -1744,6 +1797,19 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn known_def_id(&self, name: &str) -> Option<DefId> { self.symbols.lookup_type(name).map(|b| b.def_id) }
+
+    /// Resolve a trait path from a bound `Type` (e.g. `Add` or `Add<Int<32>>`) to a `DefId`.
+    fn resolve_trait_path(&self, bound: &Type) -> Option<DefId> {
+        let name = match bound {
+            Type::Path(path, _) => path.first()?,
+            Type::Generic(base, _, _) => match base.as_ref() {
+                Type::Path(path, _) => path.first()?,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.symbols.lookup_trait(name).map(|b| b.def_id)
+    }
 
     /// Attempt to dereference a type once using built-in rules.
     /// Handles `&T` / `&mut T`, `*T`, `Ptr<pointee = T>`, and known wrapper types.
@@ -2136,5 +2202,53 @@ mod tests {
             }",
         );
         assert!(result.is_ok(), "operator * should work for Int<32>: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_impl_where_clause_parse_and_trait_check() {
+        // Simple concrete impl with where clause parsed from the impl block
+        let result = check_source(
+            "
+            trait Bar { }
+            type MyInt = Int<32> with default = 0;
+            impl Bar for MyInt { }
+            def main() -> Int<32> {
+                return 0;
+            }",
+        );
+        assert!(result.is_ok(), "concrete impl should type-check: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_bare_type_var_without_context_rejected() {
+        // `impl<T> Foo for T` where T is a bare type variable not appearing
+        // in any where clause context should fail the Coverage Condition.
+        let result = check_source(
+            "
+            trait Foo { }
+            type MyInt = Int<32>;
+            impl Foo for MyInt { }
+            impl<T> Foo for T { }
+            def main() -> Int<32> { return 0; }
+            ",
+        );
+        assert!(result.is_err(), "bare type var without context should be rejected");
+    }
+
+    #[test]
+    fn test_bare_type_var_with_context_accepted() {
+        // `impl<T: Bar> Foo for T` where T appears in context as `T: Bar`
+        // should pass the Coverage Condition.
+        let result = check_source(
+            "
+            trait Foo { }
+            trait Bar { }
+            type MyInt = Int<32>;
+            impl Bar for MyInt { }
+            impl<T: Bar> Foo for T { }
+            def main() -> Int<32> { return 0; }
+            ",
+        );
+        assert!(result.is_ok(), "bare type var with context should pass: {:?}", result.err());
     }
 }

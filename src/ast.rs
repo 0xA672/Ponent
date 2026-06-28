@@ -379,6 +379,8 @@ pub enum Stmt {
         trait_path: Option<Vec<String>>,
         for_type: Type,
         methods: Vec<ImplMethod>,
+        where_clause: Option<WhereClause>,
+        type_params: Vec<TypeParam>,
     },
     Error(Span),
 }

@@ -1,4 +1,5 @@
 use crate::ast::Span;
+use crate::hir::symbol::SymbolTable;
 use crate::hir::traits::TraitEnv;
 use crate::hir::types::*;
 use rustc_hash::FxHashMap as HashMap;
@@ -56,7 +57,7 @@ impl InferenceContext {
         self.constraints.push(c);
     }
 
-    pub fn solve(&mut self, ctx: &mut TypeContext, trait_env: &TraitEnv) -> Result<(), TypeError> {
+    pub fn solve(&mut self, ctx: &mut TypeContext, trait_env: &TraitEnv, symbols: &SymbolTable) -> Result<(), TypeError> {
         // First, solve all Eq constraints
         for c in &self.constraints {
             if let Constraint::Eq(a, b, _) = c {
@@ -91,7 +92,13 @@ impl InferenceContext {
                     continue;
                 }
                 // Otherwise, check that the impl exists
-                if !trait_env.lookup_impl(*trait_id, resolved).is_some() {
+                let impl_found = if trait_env.lookup_impl(*trait_id, resolved).is_some() {
+                    true
+                } else {
+                    // Try generic matching when exact match fails
+                    trait_env.lookup_impl_generic(*trait_id, resolved, ctx, symbols).is_some()
+                };
+                if !impl_found {
                     return Err(TypeError::TraitNotImplemented {
                         ty: *ty,
                         trait_name: format!("{:?}", trait_id),

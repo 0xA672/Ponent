@@ -692,6 +692,34 @@ impl TypeContext {
         matches!(self.get(ty), TypeData::Pointer { .. })
     }
 
+    /// Compute the constructor-depth of a type for Paterson-condition checking.
+    /// GenericParam = 0, Int/Bool/etc = 1, Struct/Enum = 1 + max(depth of args)
+    pub fn type_constructor_depth(&self, ty: TypeId) -> usize {
+        match self.get(ty) {
+            TypeData::GenericParam { .. } | TypeData::InferVar { .. } => 0,
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                1 + args.iter().map(|a| self.type_constructor_depth(*a)).max().unwrap_or(0)
+            }
+            TypeData::Tuple { elems } => {
+                1 + elems.iter().map(|e| self.type_constructor_depth(*e)).max().unwrap_or(0)
+            }
+            TypeData::Array { elem, .. } => 1 + self.type_constructor_depth(*elem),
+            TypeData::Slice { elem } => 1 + self.type_constructor_depth(*elem),
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => 1 + self.type_constructor_depth(*ty),
+            TypeData::Ptr { pointee, .. } => 1 + self.type_constructor_depth(*pointee),
+            TypeData::Fn { params, ret } => {
+                1 + params.iter().map(|p| self.type_constructor_depth(*p)).max().unwrap_or(0)
+                    .max(self.type_constructor_depth(*ret))
+            }
+            TypeData::AssociatedType { self_ty, .. } => 1 + self.type_constructor_depth(*self_ty),
+            TypeData::Exists { base, .. } => 1 + self.type_constructor_depth(*base),
+            TypeData::DynTrait { .. } => 1,
+            TypeData::Int { .. } | TypeData::UInt { .. } | TypeData::Float { .. }
+            | TypeData::Bool | TypeData::Char | TypeData::Byte | TypeData::USize
+            | TypeData::Never | TypeData::Unit | TypeData::Error => 1,
+        }
+    }
+
     pub fn is_struct(&self, ty: TypeId) -> bool {
         matches!(self.get(ty), TypeData::Struct { .. })
     }

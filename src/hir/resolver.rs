@@ -3,6 +3,7 @@ use crate::diagnostics::{Diagnostic, DiagnosticCollector, DiagnosticLevel};
 use crate::hir::symbol::*;
 use crate::hir::traits::{ImplCandidate, TraitEnv};
 use crate::hir::types::*;
+use rustc_hash::FxHashMap as HashMap;
 
 pub struct NameResolver<'a> {
     ctx: &'a mut TypeContext,
@@ -14,6 +15,9 @@ pub struct NameResolver<'a> {
     current_type: Option<DefId>,
     import_map: Vec<ImportEntry>,
     local_crate_id: CrateId,
+    /// Temporary mapping of type parameter names to GenericParam TypeIds
+    /// used when resolving types inside an `impl<T>` block.
+    current_impl_type_params: Option<HashMap<String, TypeId>>,
 }
 
 struct ImportEntry {
@@ -35,6 +39,7 @@ impl<'a> NameResolver<'a> {
             current_type: None,
             import_map: Vec::new(),
             local_crate_id,
+            current_impl_type_params: None,
         }
     }
 
@@ -226,12 +231,44 @@ impl<'a> NameResolver<'a> {
                 trait_path,
                 for_type,
                 methods,
+                where_clause,
+                type_params,
                 ..
             } => {
+                // Build mapping of type parameter names for this impl block
+                let mut param_map = HashMap::default();
+                for (i, tp) in type_params.iter().enumerate() {
+                    let ty_id = self.ctx.generic_param(i, tp.name.clone());
+                    param_map.insert(tp.name.clone(), ty_id);
+                }
+                self.current_impl_type_params = Some(param_map);
+
                 let resolved_for = self.resolve_type_expr(for_type);
                 let resolved_trait = trait_path
                     .as_ref()
                     .and_then(|path| self.resolve_trait_path(path));
+
+                // Collect context types from where clause for Paterson/Coverage checking
+                let mut context = Vec::new();
+                if let Some(wc) = where_clause {
+                    for pred in &wc.predicates {
+                        let pred_ty = self.resolve_type_expr(&pred.ty);
+                        context.push(pred_ty);
+                    }
+                }
+                // Also add type params that have bounds to the context,
+                // since `impl<T: Bar>` implicitly constrains T.
+                for tp in type_params {
+                    if !tp.bounds.is_empty() {
+                        if let Some(ty_id) = self.current_impl_type_params.as_ref()
+                            .and_then(|m| m.get(&tp.name))
+                        {
+                            context.push(*ty_id);
+                        }
+                    }
+                }
+
+                self.current_impl_type_params = None;
 
                 self.enter_scope();
                 let binding = ImplBinding {
@@ -248,10 +285,21 @@ impl<'a> NameResolver<'a> {
                         methods: methods.clone(),
                         assoc_tys: Vec::new(),
                         has_auto_deref: false,
+                        context,
                         span: *span,
                     };
-                    self.trait_env
-                        .add_impl(candidate, &self.symbols, self.ctx, false);
+                    if let Err(err) = self.trait_env
+                        .add_impl(candidate, &self.symbols, self.ctx, false)
+                    {
+                        // Convert OrphanError to a diagnostic for proper error reporting
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "impl for trait on type violates termination rules: {}",
+                                err
+                            ))
+                            .with_span(*span)
+                        );
+                    }
                 }
 
                 self.exit_scope();
@@ -888,6 +936,14 @@ impl<'a> NameResolver<'a> {
     fn resolve_type_expr(&mut self, ty: &Type) -> TypeId {
         match ty {
             Type::Path(path, span) => {
+                // Check if this name refers to an impl type parameter (e.g. `T` in `impl<T>`)
+                if path.len() == 1 {
+                    if let Some(ref param_map) = self.current_impl_type_params {
+                        if let Some(&ty_id) = param_map.get(&path[0]) {
+                            return ty_id;
+                        }
+                    }
+                }
                 if let Some(def_id) = self.resolve_type_path(path) {
                     let alias = self
                         .symbols
