@@ -258,13 +258,6 @@ impl SymbolTable {
                 break;
             }
         }
-        // Fallback: search all scopes for variables registered by the resolver
-        // (needed because the checker shares the symbol table but scopes have been popped)
-        for scope in &self.scopes {
-            if let Some(binding) = scope.variables.get(name) {
-                return Some(binding);
-            }
-        }
         None
     }
 

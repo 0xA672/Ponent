@@ -441,6 +441,11 @@ impl<'a> TypeChecker<'a> {
                 guard.checker.current_return_type = Some(return_ty);
                 guard.checker.enter_inference_scope();
                 guard.checker.push_ctx(CtxKind::Function, *span, None);
+                // Pre-populate the local variable cache with function parameters,
+                // since the resolver already popped the parameter scope.
+                for p in &hir_params {
+                    guard.checker.local_variable_types.insert(p.name.clone(), p.ty);
+                }
 
                 let body_result = if let Some(body) = body {
                     let mut stmts = Vec::new();
@@ -469,6 +474,43 @@ impl<'a> TypeChecker<'a> {
                 if let Some(ref body_stmts) = body_hir {
                     let body_ty = self.block_type(body_stmts);
                     self.unify(return_ty, body_ty, *span)?;
+                }
+
+                // Contract verification skeleton: check that requires/ensures are bool,
+                // and decreases/terminates are integer types.
+                for contract in contracts {
+                    match contract {
+                        Contract::Requires(expr, cspan) | Contract::Invariant(expr, cspan) => {
+                            let (_, ty) = self.infer_expr(expr)?;
+                            if !self.ctx.is_bool(ty) {
+                                self.diagnostics.push(
+                                    Diagnostic::error("contract condition must be boolean")
+                                        .with_code("E020")
+                                        .with_span(*cspan)
+                                );
+                            }
+                        }
+                        Contract::Ensures { expr, span: cspan, .. } => {
+                            let (_, ty) = self.infer_expr(expr)?;
+                            if !self.ctx.is_bool(ty) {
+                                self.diagnostics.push(
+                                    Diagnostic::error("ensures clause must be boolean")
+                                        .with_code("E020")
+                                        .with_span(*cspan)
+                                );
+                            }
+                        }
+                        Contract::Decreases(expr, cspan) | Contract::Terminates(expr, cspan) => {
+                            let (_, ty) = self.infer_expr(expr)?;
+                            if !self.ctx.is_numeric(ty) && !self.ctx.is_integer(ty) {
+                                self.diagnostics.push(
+                                    Diagnostic::error("decreases/terminates expression must be an integer")
+                                        .with_code("E021")
+                                        .with_span(*cspan)
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let finally_hir = if let Some(finally) = finally {
@@ -644,6 +686,17 @@ impl<'a> TypeChecker<'a> {
                             .with_code("E007")
                             .with_span(*span)
                     );
+                }
+                // Ban `return Err(...)` — use `leave with` instead
+                if let Some(Expr::EnumLit { path, variant, .. }) = value {
+                    if variant == "Err" && path.len() == 1 && path[0] == "Result" {
+                        self.diagnostics.push(
+                            Diagnostic::error("`return Err(...)` is not valid; use `leave with` instead")
+                                .with_code("E008")
+                                .with_span(*span)
+                                .with_suggestion("write `leave with error_value;` instead of `return Err(error_value);`")
+                        );
+                    }
                 }
                 if let Some(value) = value {
                     if let Some(ret_ty) = self.current_return_type {
@@ -1096,7 +1149,13 @@ impl<'a> TypeChecker<'a> {
                 Ok((HirExpr::Catch { expr: Box::new(expr_hir), branches: hir_branches, ty: ok_ty, span: *span }, ok_ty))
             }
             Expr::LeaveWith { expr, span } => {
-                let (hir, _) = self.infer_expr(expr)?;
+                let (hir, err_ty) = self.infer_expr(expr)?;
+                // Validate that the error type matches the function's error type
+                if let Some(ret_ty) = self.current_return_type {
+                    if let Ok((_, error_ty)) = self.extract_result_types(ret_ty, *span) {
+                        self.unify(error_ty, err_ty, *span)?;
+                    }
+                }
                 let never = self.ctx.never();
                 Ok((HirExpr::LeaveWith { expr: Box::new(hir), ty: never, span: *span }, never))
             }
