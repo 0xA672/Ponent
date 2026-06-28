@@ -10,6 +10,9 @@ pub struct ImplCandidate {
     pub methods: Vec<crate::ast::ImplMethod>,
     pub assoc_tys: Vec<(String, TypeId)>,
     pub span: Span,
+    /// Whether this impl's method calls can be auto-deref'd through.
+    /// Set by `@auto_deref` attribute on the impl.
+    pub has_auto_deref: bool,
 }
 
 /// Describes a single method with resolved type IDs, ready for method lookup.

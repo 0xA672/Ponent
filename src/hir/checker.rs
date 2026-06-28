@@ -109,7 +109,7 @@ enum CtxKind {
     Closure,
     /// An async bwock (wike a cwosuwe) ☆ﾟ.*･｡ﾟ
     AsyncBlock,
-    /// A widdle woop (wike `woop { ... }`)
+    /// A widdle woop (wike `loop { ... }`)
     Loop,
     /// A `whiwe` woop
     While,
@@ -257,9 +257,9 @@ impl<'a> TypeChecker<'a> {
                         continue;
                     }
                     let kind_str = match frame.kind {
-                        CtxKind::Loop => "woop",
-                        CtxKind::While => "whiwe",
-                        CtxKind::For => "fow",
+                        CtxKind::Loop => "loop",
+                        CtxKind::While => "while",
+                        CtxKind::For => "for",
                         _ => unreachable!(),
                     };
                     return Some((frame.span, kind_str));
@@ -1759,6 +1759,24 @@ impl<'a> TypeChecker<'a> {
         // Deweference `Ptr<pointee = T>` → `T` (*＾▽＾)／
         if let TypeData::Ptr { pointee, .. } = self.ctx.get(ty) {
             return Some(*pointee);
+        }
+        // Try dewefewence via `Deref` twait with `@auto_dewef` mawk uwu
+        self.try_deref_trait_step(ty)
+    }
+
+    /// Attempt to dereference through a `Deref` trait impl marked `@auto_deref`.
+    fn try_deref_trait_step(&self, ty: TypeId) -> Option<TypeId> {
+        let deref_trait_id = self.symbols.lookup_trait("Deref").map(|b| b.def_id)?;
+        let candidates = self.trait_env.lookup_impls_for_type(ty);
+        for cand in candidates {
+            if cand.trait_id == deref_trait_id && cand.has_auto_deref {
+                if let Some(target_ty) = cand.assoc_tys.iter()
+                    .find(|(name, _)| name == "Target")
+                    .map(|(_, ty)| *ty)
+                {
+                    return Some(target_ty);
+                }
+            }
         }
         None
     }

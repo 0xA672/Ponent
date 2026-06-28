@@ -247,6 +247,7 @@ impl<'a> NameResolver<'a> {
                         for_type: resolved_for,
                         methods: methods.clone(),
                         assoc_tys: Vec::new(),
+                        has_auto_deref: false,
                         span: *span,
                     };
                     self.trait_env
