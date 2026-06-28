@@ -202,4 +202,10 @@ pub fn register_builtins(
         };
         symbols.insert_type("Future".to_string(), binding, Span::new(0, 0)).ok();
     }
+
+    // Register standard traits for error suggestions and future use
+    insert_trait(symbols, "From", &mut DefId(0));
+    insert_trait(symbols, "Into", &mut DefId(0));
+    insert_trait(symbols, "Sized", &mut DefId(0));
+    insert_trait(symbols, "Deref", &mut DefId(0));
 }

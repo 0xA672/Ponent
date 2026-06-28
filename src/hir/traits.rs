@@ -18,6 +18,10 @@ pub struct MethodInfo {
     pub param_tys: Vec<TypeId>,
     pub ret_ty: TypeId,
     pub span: Span,
+    /// Whether this method's `Deref` impl is marked `@auto_deref`.
+    /// Without this flag, even if a type implements `Deref`, the compiler
+    /// will NOT automatically dereference through it — the user must write `*x`.
+    pub has_auto_deref: bool,
 }
 
 pub struct TraitEnv {

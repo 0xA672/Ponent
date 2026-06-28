@@ -427,6 +427,7 @@ impl<'a> TypeChecker<'a> {
                     } else {
                         self.ctx.error()
                     };
+                    self.require_type_sized(param_ty, param.span);
                     hir_params.push(HirParam {
                         name: param.name.clone(),
                         ty: param_ty,
@@ -767,6 +768,7 @@ impl<'a> TypeChecker<'a> {
                             param_tys,
                             ret_ty,
                             span: m.span,
+                            has_auto_deref: false, // @auto_deref not yet supported
                         });
                     }
                     self.trait_env.add_inherent_methods(for_def_id, method_infos);
@@ -1598,20 +1600,49 @@ impl<'a> TypeChecker<'a> {
 
     fn check_cast(&mut self, from: TypeId, to: TypeId, safe: bool, span: Span) -> Result<TypeId, Diagnostic> {
         if safe {
-            if (self.ctx.is_numeric(from) && self.ctx.is_numeric(to)) || (self.ctx.is_bool(from) && self.ctx.is_integer(to)) || (self.ctx.is_integer(from) && self.ctx.is_bool(to)) {
+            if (self.ctx.is_numeric(from) && self.ctx.is_numeric(to))
+                || (self.ctx.is_bool(from) && self.ctx.is_integer(to))
+                || (self.ctx.is_integer(from) && self.ctx.is_bool(to))
+            {
                 Ok(to)
+            } else if self.ctx.is_reference(from) {
+                Err(Diagnostic::error("safe cast from reference type requires explicit dereference or unsafe cast")
+                    .with_code("E601")
+                    .with_span(span)
+                    .with_suggestion("consider dereferencing first: `*expr as TargetType`")
+                    .with_suggestion("or use `as!` for an unsafe bitcast"))
             } else {
-                Err(Diagnostic::error("safe cast only allowed between numeric and boolean types").with_span(span))
+                Err(Diagnostic::error("safe cast only allowed between numeric and boolean types")
+                    .with_code("E601")
+                    .with_span(span)
+                    .with_suggestion("use `From` trait for non-primitive type conversions"))
             }
         } else {
-            if (self.ctx.is_numeric(from) && self.ctx.is_numeric(to)) || (self.ctx.is_reference(from) && self.ctx.is_pointer(to)) || (self.ctx.is_pointer(from) && self.ctx.is_reference(to)) {
+            if (self.ctx.is_numeric(from) && self.ctx.is_numeric(to))
+                || (self.ctx.is_reference(from) && self.ctx.is_pointer(to))
+                || (self.ctx.is_pointer(from) && self.ctx.is_reference(to))
+            {
                 Ok(to)
             } else if let (TypeData::Ptr { .. }, TypeData::Ptr { .. }) = (self.ctx.get(from), self.ctx.get(to)) {
                 Ok(to)
+            } else if self.ctx.is_reference(from) && self.ctx.is_integer(to) {
+                Err(Diagnostic::error("unsafe cast from reference to integer not yet supported")
+                    .with_code("E601")
+                    .with_span(span)
+                    .with_suggestion("consider using `*expr as usize` via a pointer cast"))
             } else {
-                Err(Diagnostic::error("unsafe cast requires compatible types").with_span(span))
+                Err(Diagnostic::error("unsafe cast requires compatible types (numeric↔numeric, ref↔ptr, ptr↔ptr)")
+                    .with_code("E601")
+                    .with_span(span))
             }
         }
+    }
+
+    /// Placeholder for future `Sized` requirement checking.
+    /// Currently allows all types without error, as Posita does not yet have a `Sized` trait.
+    fn require_type_sized(&self, _ty: TypeId, _span: Span) {
+        // Reserved for future use: `self.require_trait_bound(ty, Sized, span)`
+        // For now, all types are considered "sized" by default.
     }
 
     fn check_result_type(&self, ty: TypeId, span: Span) -> Result<TypeId, Diagnostic> {
@@ -1654,39 +1685,17 @@ impl<'a> TypeChecker<'a> {
     /// Attempt to dereference a type once using built-in rules.
     /// Handles `&T` / `&mut T`, `*T`, `Ptr<pointee = T>`, and known wrapper types.
     fn builtin_deref_ty(&self, ty: TypeId) -> Option<TypeId> {
-        // Direct reference/pointer deref
+        // Deweference `&T` / `&mut T` → `T` uwu
         if let Some(inner) = self.ctx.pointee_of_ref(ty) {
             return Some(inner);
         }
+        // Deweference `*T` → `T` (つω`｡)
         if let Some(inner) = self.ctx.pointee_of_pointer(ty) {
             return Some(inner);
         }
-        // Ptr<pointee = T> deref
+        // Deweference `Ptr<pointee = T>` → `T` (*＾▽＾)／
         if let TypeData::Ptr { pointee, .. } = self.ctx.get(ty) {
             return Some(*pointee);
-        }
-        // For Box<T>, Rc<T> etc: if it's a Struct with a single generic arg and
-        // we can find a Deref impl, deref through that. For now, hardcode Box/Rc
-        // lookup via known_def_id and check for single-arg structs.
-        if let TypeData::Struct { def_id, args } = self.ctx.get(ty) {
-            if args.len() == 1 {
-                if let Some(binding) = self.symbols.lookup_type_by_def_id(*def_id) {
-                    // If the name contains "Box" or "Rc" we try deref through the type arg
-                    let name = binding.def_id; // positional, not a great check — fallback: try the first arg
-                    // In a full implementation we'd look for a Deref impl in trait_env.
-                    // For now, just unwrap one layer for single-arg "smart pointer" structs
-                    // that have a field named "ptr" or "inner" of the parameter type.
-                    // Simpler heuristic: if it's a struct wrapping one generic param,
-                    // the only field likely holds the inner value.
-                    if let Some(field) = binding.fields.first() {
-                let field_ty = self.ctx.subst(field.ty, &Subst::new());
-                // If the field type is just the generic param, return args[0]
-                        if let TypeData::GenericParam { .. } = self.ctx.get(field_ty) {
-                            return Some(args[0]);
-                        }
-                    }
-                }
-            }
         }
         None
     }
