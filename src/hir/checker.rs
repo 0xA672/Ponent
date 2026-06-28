@@ -706,8 +706,12 @@ impl<'a> TypeChecker<'a> {
                 // no additional checking needed here.
                 Ok(HirStmt::Error)
             }
+            Stmt::Edition(..) => {
+                // Edition declarations are handled by the parser; skip silently.
+                Ok(HirStmt::Error)
+            }
             Stmt::TraitDef { .. } | Stmt::Import { .. }
-            | Stmt::ExternFunction { .. } | Stmt::Constraint { .. } | Stmt::Edition(..) => {
+            | Stmt::ExternFunction { .. } | Stmt::Constraint { .. } => {
                 self.diagnostics.push(Diagnostic::error("top-level item not yet supported in type checker").with_span(stmt.span()));
                 Ok(HirStmt::Error)
             }
