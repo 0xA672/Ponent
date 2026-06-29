@@ -1060,6 +1060,20 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 let (callee_hir, callee_ty) = self.infer_expr(callee)?;
+
+                // Try local type argument synthesis first: detect polymorphic functions
+                // whose parameter types contain GenericParam (type variables that need
+                // to be inferred from argument types).
+                match self.try_synthesize_type_args(&callee_hir, callee_ty, args, *comptime, None, *span) {
+                    Ok(Some(result)) => return Ok(result),
+                    Ok(None) => { /* not polymorphic, fall through */ }
+                    Err(diag) => {
+                        self.diagnostics.push(diag);
+                        return Ok((HirExpr::Error(*span), self.ctx.error()));
+                    }
+                }
+
+                // Normal (non-polymorphic) function call
                 if let Some(params) = self.ctx.params_of_fn(callee_ty) {
                     let param_tys = params.to_vec();
                     let ret_ty = self.ctx.ret_of_fn(callee_ty).unwrap_or(self.ctx.error());
@@ -1964,6 +1978,217 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Local type argument synthesis (Pierce & Turner 2000, §3).
+    /// When a function type's parameters contain GenericParam (uninstantiated type
+    /// variables), this creates fresh InferVars for them, infers argument types,
+    /// unifies to bind the InferVars, and returns the resolved call result.
+    fn try_synthesize_type_args(
+        &mut self,
+        callee_hir: &HirExpr,
+        callee_ty: TypeId,
+        args: &[Expr],
+        comptime: bool,
+        expected: Option<TypeId>,
+        span: Span,
+    ) -> Result<Option<(HirExpr, TypeId)>, Diagnostic> {
+        // Only works on Fn types
+        let (params, ret) = match self.ctx.params_of_fn(callee_ty)
+            .zip(self.ctx.ret_of_fn(callee_ty)) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let param_tys = params.to_vec();
+
+        // Collect GenericParam indices from parameter types AND return type
+        let mut generic_indices: Vec<usize> = Vec::new();
+        for &pt in &param_tys {
+            Self::collect_generic_param_indices(pt, &self.ctx, &mut generic_indices);
+        }
+        Self::collect_generic_param_indices(ret, &self.ctx, &mut generic_indices);
+        generic_indices.sort();
+        generic_indices.dedup();
+        if generic_indices.is_empty() {
+            return Ok(None);
+        }
+
+        // Create fresh InferVars for each GenericParam index
+        let mut infer_var_for_index: Vec<TypeId> = Vec::new();
+        for _ in &generic_indices {
+            let var = self.new_infer_var(TypeVariableKind::Any);
+            infer_var_for_index.push(var);
+        }
+
+        // Build substitution: GenericParam index → fresh InferVar
+        let mut subst = Subst::new();
+        for (&gp_idx, &var) in generic_indices.iter().zip(infer_var_for_index.iter()) {
+            subst.insert(gp_idx, var);
+        }
+
+        // Substitute the InferVars into param types and return type
+        let substituted_params: Vec<TypeId> = param_tys.iter()
+            .map(|&pt| self.ctx.subst(pt, &subst))
+            .collect();
+        let substituted_ret = self.ctx.subst(ret, &subst);
+
+        // Check arity
+        if substituted_params.len() != args.len() {
+            return Err(Diagnostic::error(format!(
+                "wrong number of arguments: expected {}, found {}",
+                substituted_params.len(), args.len()
+            )).with_span(span));
+        }
+
+        // If an expected type is provided (checking mode), proceed conservatively:
+        // if the return type contains any InferVar in contravariant position (e.g.
+        // inside Fn params), fall back to let the normal call path handle it.
+        // Otherwise, try unifying with the expected type — if that fails, fall back
+        // rather than erroring, since the normal path may produce a better diagnostic.
+        if let Some(exp_ty) = expected {
+            // Quick check for contravariant occurrences: if any InferVar appears
+            // inside Fn params within the return type, fall back.
+            let has_contra = Self::type_var_in_problematic_position(substituted_ret, &infer_var_for_index, &self.ctx);
+            if has_contra {
+                return Ok(None);
+            }
+            // Try unification — if it fails, don't error; just fall back.
+            if self.ctx.unify(substituted_ret, exp_ty).is_err() {
+                return Ok(None);
+            }
+        }
+
+        // Infer argument types and unify with substituted parameter types
+        let mut hir_args = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            let expected_param_ty = substituted_params.get(i).copied().unwrap_or(self.ctx.error());
+            let hir_arg = self.check_expr(arg, Expectation::HasType(expected_param_ty),
+                TypingContext::Argument { index: i, total: args.len() })?;
+            hir_args.push(hir_arg);
+        }
+
+        // After unification, the InferVars have been bound to concrete types.
+        // Create a final substitution from GenericParam indices to their resolved types.
+        let mut final_subst = Subst::new();
+        for (&gp_idx, &var) in generic_indices.iter().zip(infer_var_for_index.iter()) {
+            let resolved = self.ctx.resolve_binding(var);
+            // Cannot resolve — reuse the InferVar itself; the caller will fallback
+            if self.ctx.is_error(resolved) || self.ctx.is_infer_var(resolved) {
+                return Ok(None);
+            }
+            final_subst.insert(gp_idx, resolved);
+        }
+
+        // Apply the resolved substitution to the return type
+        let final_ret = self.ctx.subst(ret, &final_subst);
+        Ok(Some((HirExpr::Call { callee: Box::new(callee_hir.clone()), args: hir_args, comptime, ty: final_ret, span }, final_ret)))
+    }
+
+    /// Collect all GenericParam indices appearing in a type.
+    fn collect_generic_param_indices(ty: TypeId, ctx: &TypeContext, out: &mut Vec<usize>) {
+        match ctx.get(ty) {
+            TypeData::GenericParam { index, .. } => out.push(*index),
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                for &a in args { Self::collect_generic_param_indices(a, ctx, out); }
+            }
+            TypeData::Tuple { elems } => {
+                for &e in elems { Self::collect_generic_param_indices(e, ctx, out); }
+            }
+            TypeData::Array { elem, .. } => Self::collect_generic_param_indices(*elem, ctx, out),
+            TypeData::Slice { elem } => Self::collect_generic_param_indices(*elem, ctx, out),
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                Self::collect_generic_param_indices(*ty, ctx, out);
+            }
+            TypeData::Ptr { pointee, .. } => Self::collect_generic_param_indices(*pointee, ctx, out),
+            TypeData::Fn { params, ret } => {
+                for &p in params { Self::collect_generic_param_indices(p, ctx, out); }
+                Self::collect_generic_param_indices(*ret, ctx, out);
+            }
+            TypeData::AssociatedType { self_ty, .. } => Self::collect_generic_param_indices(*self_ty, ctx, out),
+            TypeData::Exists { base, .. } => Self::collect_generic_param_indices(*base, ctx, out),
+            _ => {}
+        }
+    }
+
+    /// Check if any of the given InferVars appear in a position where
+    /// unification with an expected type could be unsound:
+    /// - Inside Fn params (contravariant)
+    /// - Inside Ref/Pointer/Ptr (invariant)
+    /// If so, we conservatively fall back to normal call handling.
+    fn type_var_in_problematic_position(ty: TypeId, vars: &[TypeId], ctx: &TypeContext) -> bool {
+        match ctx.get(ty) {
+            TypeData::Fn { params, ret } => {
+                // Fn params are contravariant — check each param for vars
+                for &p in params {
+                    for &v in vars {
+                        if Self::type_tree_contains(p, v, ctx) {
+                            return true;
+                        }
+                    }
+                }
+                // Return type is covariant — safe to recurse normally
+                Self::type_var_in_problematic_position(*ret, vars, ctx)
+            }
+            // Ref/Pointer/Ptr are invariant — if any var appears inside, it's risky
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                for &v in vars {
+                    if Self::type_tree_contains(*ty, v, ctx) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TypeData::Ptr { pointee, .. } => {
+                for &v in vars {
+                    if Self::type_tree_contains(*pointee, v, ctx) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                args.iter().any(|&a| Self::type_var_in_problematic_position(a, vars, ctx))
+            }
+            TypeData::Tuple { elems } => {
+                elems.iter().any(|&e| Self::type_var_in_problematic_position(e, vars, ctx))
+            }
+            TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+                Self::type_var_in_problematic_position(*elem, vars, ctx)
+            }
+            TypeData::AssociatedType { self_ty, .. } => Self::type_var_in_problematic_position(*self_ty, vars, ctx),
+            TypeData::Exists { base, .. } => Self::type_var_in_problematic_position(*base, vars, ctx),
+            _ => false,
+        }
+    }
+
+    /// Check if a specific TypeId appears anywhere in a type tree.
+    fn type_tree_contains(ty: TypeId, target: TypeId, ctx: &TypeContext) -> bool {
+        let resolved = ctx.resolve_binding(ty);
+        if resolved == ctx.resolve_binding(target) {
+            return true;
+        }
+        match ctx.get(resolved) {
+            TypeData::Struct { args, .. } | TypeData::Enum { args, .. } => {
+                args.iter().any(|&a| Self::type_tree_contains(a, target, ctx))
+            }
+            TypeData::Tuple { elems } => {
+                elems.iter().any(|&e| Self::type_tree_contains(e, target, ctx))
+            }
+            TypeData::Array { elem, .. } | TypeData::Slice { elem } => {
+                Self::type_tree_contains(*elem, target, ctx)
+            }
+            TypeData::Ref { ty, .. } | TypeData::Pointer { ty } => {
+                Self::type_tree_contains(*ty, target, ctx)
+            }
+            TypeData::Ptr { pointee, .. } => Self::type_tree_contains(*pointee, target, ctx),
+            TypeData::Fn { params, ret } => {
+                params.iter().any(|&p| Self::type_tree_contains(p, target, ctx))
+                || Self::type_tree_contains(*ret, target, ctx)
+            }
+            TypeData::AssociatedType { self_ty, .. } => Self::type_tree_contains(*self_ty, target, ctx),
+            TypeData::Exists { base, .. } => Self::type_tree_contains(*base, target, ctx),
+            _ => false,
+        }
+    }
+
     fn lookup_field(&self, ty: TypeId, name: &str, span: Span) -> Result<TypeId, Diagnostic> {
         // Collect field names from all types in the deref chain for error reporting
         let mut all_field_names: Vec<String> = Vec::new();
@@ -2357,5 +2582,172 @@ mod tests {
             ",
         );
         assert!(result.is_ok(), "bare type var with context should pass: {:?}", result.err());
+    }
+
+    // ── Generic type parameter synthesis ──────────────────────────
+    // Note: these require the resolver to register generic type parameters
+    // from function signatures. Currently the resolver does not do this,
+    // so these tests are ignored until that support is added.
+
+    #[test]
+    #[ignore = "resolver does not yet register generic type params from function sigs"]
+    fn test_polymorphic_identity_call() {
+        let result = check_source(
+            "def id<T>(x: T) -> T { return x; }
+             def main() -> Int<32> {
+                 return id(42);
+             }",
+        );
+        assert!(result.is_ok(), "polymorphic id(42) should synthesize T = Int<32>: {:?}", result.err());
+    }
+
+    #[test]
+    #[ignore = "resolver does not yet register generic type params from function sigs"]
+    fn test_polymorphic_bool_call() {
+        let result = check_source(
+            "def id<T>(x: T) -> T { return x; }
+             def main() -> Bool {
+                 set b = id(true);
+                 return b;
+             }",
+        );
+        assert!(result.is_ok(), "polymorphic id(true) should synthesize T = Bool: {:?}", result.err());
+    }
+
+    #[test]
+    #[ignore = "resolver does not yet register generic type params from function sigs"]
+    fn test_polymorphic_pair() {
+        let result = check_source(
+            "def pair<T, U>(a: T, b: U) -> T { return a; }
+             def main() -> Int<32> {
+                 return pair(42, true);
+             }",
+        );
+        assert!(result.is_ok(), "polymorphic pair with two type params: {:?}", result.err());
+    }
+
+    // ── Trait impl and operator overload ──────────────────────────
+
+    #[test]
+    fn test_trait_impl_basic() {
+        let result = check_source(
+            "trait Show { }
+             type MyInt = Int<32> with default = 0;
+             impl Show for MyInt { }
+             def main() -> Int<32> { return 0; }",
+        );
+        assert!(result.is_ok(), "basic trait impl: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_operator_plus() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                 return 10 + 20;
+             }",
+        );
+        assert!(result.is_ok(), "operator +: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_operator_mul() {
+        let result = check_source(
+            "def main() -> Int<32> {
+                 return 6 * 7;
+             }",
+        );
+        assert!(result.is_ok(), "operator *: {:?}", result.err());
+    }
+
+    // ── Autoderef ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_autoderef_field_through_ref() {
+        let result = check_source(
+            "type Point = struct { x: Int<32>, y: Int<32> }
+             def main() -> Int<32> {
+                 set p = Point { x = 10, y = 20 };
+                 set r = &p;
+                 return r.x;
+             }",
+        );
+        assert!(result.is_ok(), "field access through &ref via autoderef: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_autoderef_method_through_ref() {
+        let result = check_source(
+            "type MyType = struct { val: Int<32> }
+             impl for MyType {
+                 def get_val(&self) -> Int<32> { return self.val; }
+             }
+             def main() -> Int<32> {
+                 set obj = MyType { val = 42 };
+                 set r = &obj;
+                 return r.get_val();
+             }",
+        );
+        assert!(result.is_ok(), "method call through &ref via autoderef: {:?}", result.err());
+    }
+
+    // ── Error message verification ────────────────────────────────
+
+    #[test]
+    fn test_error_type_mismatch() {
+        let result = check_source(
+            "def main() -> Int<32> { return true; }",
+        );
+        assert!(result.is_err(), "type mismatch should error");
+        let all = result.err().unwrap().join(" ");
+        assert!(!all.is_empty(), "should have at least one error message");
+    }
+
+    #[test]
+    fn test_error_undefined_variable() {
+        let result = check_source(
+            "def main() -> Int<32> { return x; }",
+        );
+        assert!(result.is_err(), "undefined variable should error");
+        let all = result.err().unwrap().join(" ");
+        assert!(all.contains("undefined"), "error should mention 'undefined': {}", all);
+    }
+
+    #[test]
+    fn test_error_wrong_argument_count() {
+        let result = check_source(
+            "def add(a: Int<32>, b: Int<32>) -> Int<32> { return a + b; }
+             def main() -> Int<32> { return add(1); }",
+        );
+        assert!(result.is_err(), "wrong argument count should error");
+        let all = result.err().unwrap().join(" ");
+        assert!(all.contains("wrong number"), "error should mention arg count: {}", all);
+    }
+
+    #[test]
+    fn test_error_no_such_field() {
+        let result = check_source(
+            "type T = struct { x: Int<32> }
+             def main() -> Int<32> {
+                 set t = T { x = 42 };
+                 return t.y;
+             }",
+        );
+        assert!(result.is_err(), "missing field should error");
+        let all = result.err().unwrap().join(" ");
+        assert!(all.contains("no field"), "error should mention 'no field': {}", all);
+    }
+
+    #[test]
+    fn test_error_no_method() {
+        let result = check_source(
+            "type T = struct { x: Int<32> }
+             def main() -> Int<32> {
+                 set t = T { x = 42 };
+                 return t.foo();
+             }",
+        );
+        assert!(result.is_err(), "no matching method should error");
+        let all = result.err().unwrap().join(" ");
+        assert!(all.contains("no method"), "error should mention 'no method': {}", all);
     }
 }
