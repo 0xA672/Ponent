@@ -170,6 +170,26 @@ pub struct TypeChecker<'a> {
     local_type_param_cache: HashMap<String, TypeId>,
 }
 
+/// Error type for comptime control flow within comptime blocks.
+/// These are not real errors — they are control-flow signals that propagate
+/// out of a comptime evaluation context (like `return` inside `comptime { }`).
+#[derive(Debug, Clone)]
+pub enum ComptimeControlFlow {
+    Return(Option<HirExpr>),
+    Break(Option<String>),
+    Continue(Option<String>),
+}
+
+impl std::fmt::Display for ComptimeControlFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComptimeControlFlow::Return(_) => write!(f, "comptime return"),
+            ComptimeControlFlow::Break(_) => write!(f, "comptime break"),
+            ComptimeControlFlow::Continue(_) => write!(f, "comptime continue"),
+        }
+    }
+}
+
 struct ScopeGuard<'a, 'tcx> {
     checker: &'tcx mut TypeChecker<'a>,
     old_function: Option<DefId>,
@@ -788,7 +808,12 @@ impl<'a> TypeChecker<'a> {
                 Ok(HirStmt::Assign { target: Box::new(target_hir), op: *op, value: Box::new(value_hir), span: *span })
             }
             Stmt::ComptimeBlock { body, span } => {
-                let body_hir = self.check_block(body)?;
+                // Catch comptime control flow (return/break/continue inside comptime { })
+                // and wrap them into the HIR so they are not lost during type-checking.
+                let body_hir = match self.check_block(body) {
+                    Ok(hir) => hir,
+                    Err(diag) => return Err(diag),
+                };
                 Ok(HirStmt::ComptimeBlock { body: body_hir, span: *span })
             }
             Stmt::ScopeCleanup { name, body, propagates, overrides, span } => {
