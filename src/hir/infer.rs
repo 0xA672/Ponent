@@ -136,6 +136,21 @@ impl Constraint {
     }
 }
 
+/// Generalization status for an inference variable (OmniML §6).
+/// Tracks whether a variable can be fully generalized, partially generalized,
+/// or is still waiting for suspended constraints to be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenStatus {
+    /// (I) Initial — not yet generalized
+    Ungeneralized,
+    /// (G) Fully generalized — safe to copy instances
+    Generalized,
+    /// (PG) Partially generalizable — guarded by a suspended constraint
+    PartiallyGeneralizable,
+    /// (PI) Partial instance — previously PG but has been updated; needs re-generalization
+    PartialInstance,
+}
+
 #[derive(Debug, Clone)]
 pub struct InferenceContext {
     type_vars: Vec<TypeVar>,
@@ -158,6 +173,13 @@ pub struct InferenceContext {
     /// When the var is bound (unified with a concrete type), these constraints
     /// are woken and reprocessed, enabling bidirectional type information flow.
     wait_lists: Vec<Vec<Constraint>>,
+    /// Guard sets (OmniML §6): for each InferVar, which constraints (by index)
+    /// reference it in a suspended match.  A non-empty guard set means the
+    /// variable is PG (PartiallyGeneralizable).  When all guards are discharged,
+    /// the variable can become G (Generalized).
+    guard_sets: Vec<Vec<usize>>,
+    /// Per-variable generalisation status (I / G / PG / PI).
+    gen_statuses: Vec<GenStatus>,
 }
 
 impl InferenceContext {
@@ -171,6 +193,8 @@ impl InferenceContext {
             lower_bounds: Vec::new(),
             upper_bounds: Vec::new(),
             wait_lists: Vec::new(),
+            guard_sets: Vec::new(),
+            gen_statuses: Vec::new(),
         }
     }
 
@@ -195,6 +219,12 @@ impl InferenceContext {
         }
         while self.wait_lists.len() <= id {
             self.wait_lists.push(Vec::new());
+        }
+        while self.guard_sets.len() <= id {
+            self.guard_sets.push(Vec::new());
+        }
+        while self.gen_statuses.len() <= id {
+            self.gen_statuses.push(GenStatus::Ungeneralized);
         }
         ty_id
     }
@@ -333,6 +363,43 @@ impl InferenceContext {
             for c in suspended {
                 let p = c.priority(ctx);
                 heap.push(PrioritizedConstraint { priority: p, constraint: c });
+            }
+        }
+    }
+
+    /// Get the generalisation status for a variable.
+    pub fn get_gen_status(&self, var_id: usize) -> Option<GenStatus> {
+        self.gen_statuses.get(var_id).copied()
+    }
+
+    /// Mark a variable as guarded by a suspended constraint.
+    /// Adds `constraint_idx` to the variable's guard set and sets status to PG.
+    pub fn add_guard(&mut self, var_id: usize, constraint_idx: usize) {
+        while self.guard_sets.len() <= var_id {
+            self.guard_sets.push(Vec::new());
+        }
+        let guards = &mut self.guard_sets[var_id];
+        if !guards.contains(&constraint_idx) {
+            guards.push(constraint_idx);
+            if var_id < self.gen_statuses.len() {
+                self.gen_statuses[var_id] = GenStatus::PartiallyGeneralizable;
+            }
+        }
+    }
+
+    /// Remove a guard from a variable when its suspended constraint is discharged.
+    /// If no guards remain, the variable can be re-generalised.
+    pub fn remove_guard(&mut self, var_id: usize, constraint_idx: usize) {
+        if var_id < self.guard_sets.len() {
+            let guards = &mut self.guard_sets[var_id];
+            guards.retain(|&g| g != constraint_idx);
+            if guards.is_empty() && var_id < self.gen_statuses.len() {
+                // All guards discharged — the variable can become Generalized (G)
+                // if it was previously PG.  If it was PI, it stays PI until
+                // re-unified.
+                if self.gen_statuses[var_id] == GenStatus::PartiallyGeneralizable {
+                    self.gen_statuses[var_id] = GenStatus::Generalized;
+                }
             }
         }
     }
@@ -573,10 +640,16 @@ impl InferenceContext {
             }
         }
 
-        // Defaulting: unfilled infer vars get default types
+        // Defaulting: unfilled infer vars get default types,
+        // UNLESS they are PartiallyGeneralizable (guarded by suspended constraints).
         for (i, &ty_id) in self.var_type_ids.iter().enumerate() {
             let resolved = ctx.resolve_binding(ty_id);
             if let TypeData::InferVar { .. } = ctx.get(resolved) {
+                // Skip variables that are PG — they still have suspended constraints
+                // and will be re-generalized when those constraints are discharged.
+                if i < self.gen_statuses.len() && self.gen_statuses[i] == GenStatus::PartiallyGeneralizable {
+                    continue;
+                }
                 let default_ty = match self.type_vars[i].kind {
                     TypeVariableKind::Integer => ctx.int(32, true),
                     TypeVariableKind::Float => ctx.float(64),

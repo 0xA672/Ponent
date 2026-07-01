@@ -410,142 +410,132 @@ impl TypeContext {
 
     /// Single-pass Yoneda reduction (used internally by `try_yoneda_reduce`).
     ///
-    /// ### Patterns
-    /// - **Case A‑1 (Forall, Yoneda)**: `∀X. Fn { params: [Fn{A, X}], ret: B⟨X⟩ }`
-    ///   → extract `A` from inner Fn's params, `replace_generic(ret, X, A)`
-    /// - **Case A‑2 (Forall, co‑Yoneda)**: `∀X. Fn { params: [Fn{X, A}], ret: B⟨X⟩ }`
-    ///   → extract `A` from inner Fn's ret, `replace_generic(ret, X, A)`
-    /// - **Case A‑3 (Forall, distributed)**: `∀X. Fn { params: [Fn{A₁, …, Aₙ, X}], ret: B⟨X⟩ }`
-    ///   → `replace_generic(ret, X, (A₁, …, Aₙ))`
-    ///   The bound X appears as the *last* inner Fn param (not return), and all prior
-    ///   inner params co-vary with X.  This lifts the `params.len() == 1` restriction.
-    /// - **Case B (implicit Fn‑encoded)**: same as above but without the outer Forall wrapper.
+    /// Matches the ≡_X / ≡_X schemas from Pistone & Tranchini (2022) §2.
+    ///
+    /// **≡_X (Yoneda)** – each branch's *return* is the bound variable X:
+    /// ```text
+    /// ∀X. ∀Y⃗. ⟨ ∀Z⃗ₖ. ⟨Aⱼₖ⟨X⟩⟩ⱼ ⇒ X ⟩ₖ ⇒ B⟨X⟩
+    ///   ≡_X
+    /// ∀Y⃗. B⟨X ↦ Σₖ ∃Z⃗ₖ. Πⱼ Aⱼₖ⟨X⟩⟩
+    /// ```
+    ///
+    /// **≡_X (co-Yoneda)** – each branch's *first param* is the bound variable X:
+    /// ```text
+    /// ∀X. ∀Y⃗. ⟨ ∀Z⃗ₖ. X ⇒ Aⱼ⟨X⟩ ⟩ₖ ⇒ B⟨X⟩
+    ///   ≡_X
+    /// ∀Y⃗. B⟨X ↦ νX. ∀Z⃗ₖ. Πⱼ Aⱼ⟨X⟩⟩
+    /// ```
+    ///
+    /// Terms: `Σₖ` = sum (multi-branch → Tuple of results), `Πⱼ` = product (Tuple),
+    /// `∃Z⃗ₖ` = Exists node when the branch has inner quantifiers.
+    /// μX/νX fixpoints are elided when X does not appear in B⟨X⟩ (common case).
     fn yoneda_reduce_once(&mut self, ty: TypeId) -> TypeId {
-        // Case A: explicit Forall node
+        // ── Case A: explicit Forall node ──────────────────────────────
         if let TypeData::Forall { param_index, param_name: _, body } = self.get(ty).clone() {
             if let TypeData::Fn { params, ret } = self.get(body).clone() {
-                if params.len() == 1 {
-                    let inner = params[0];
-                    if let TypeData::Fn { params: inner_params, ret: inner_ret } = self.get(inner).clone() {
-                        let inner_a = inner_params[0];
-                        let has_multi = inner_params.len() > 1;
-                        // Case 1 & 3 (distributed): inner_ret is GenericParam X
-                        //   single-param: B[X ↦ A]
-                        //   multi-param:  B[X ↦ (A₁, …, Aₙ)]
-                        if let TypeData::GenericParam { index, .. } = self.get(inner_ret).clone() {
-                            if index == param_index {
-                                let replacement = if has_multi {
-                                    let all_params: Vec<TypeId> = inner_params.clone(); // all = A₁..Aₙ
-                                    self.tuple(all_params)
-                                } else {
-                                    inner_a
-                                };
-                                return self.replace_generic(ret, param_index, replacement);
+                let pi = param_index;
+                let mut branch_replacements: Vec<TypeId> = Vec::new();
+                for branch in params {
+                    // Peel outer Forall layers (∀Z⃗ₖ).
+                    let mut inner_quantifiers: Vec<(usize, String)> = Vec::new();
+                    let mut inner = branch;
+                    loop {
+                        match self.get(inner).clone() {
+                            TypeData::Forall { param_index: fi, param_name: fn_, body: b } => {
+                                inner_quantifiers.push((fi, fn_));
+                                inner = b;
                             }
-                        }
-                        // Case 2: ∀X.(X ⇒ A) ⇒ B⟨X⟩  →  B[X↦A]  (co-Yoneda)
-                        // inner_a is the GenericParam X
-                        if let TypeData::GenericParam { index, .. } = self.get(inner_a).clone() {
-                            if index == param_index {
-                                return self.replace_generic(ret, param_index, inner_ret);
-                            }
-                        }
-                        // Case 3: ∀X.(A₁, …, Aₙ, X) ⇒ B⟨X⟩  →  B[X↦(A₁, …, Aₙ)]  (distributed)
-                        // X appears as the LAST inner param, not the return.
-                        // All prior params co-vary, so the combined input is their tuple.
-                        if inner_params.len() > 1 {
-                            if let TypeData::GenericParam { index, .. } = self.get(inner_params[inner_params.len() - 1]).clone() {
-                                if index == param_index {
-                                    let mut tuple_args: Vec<TypeId> = inner_params.clone();
-                                    tuple_args.pop(); // remove X
-                                    let product = self.tuple(tuple_args);
-                                    return self.replace_generic(ret, param_index, product);
-                                }
-                            }
+                            _ => break,
                         }
                     }
-                    // Distributed sum-type: the inner param is an Enum whose variants
-                    // are all Fn{Aᵢ, X} or Fn{X, Aᵢ}.
-                    if let TypeData::Enum { def_id, args } = self.get(inner).clone() {
-                        let mut branch_inputs: Vec<TypeId> = Vec::new();
-                        for variant_ty in &args {
-                            if let TypeData::Fn { params: vp, ret: vr } = self.get(*variant_ty).clone() {
-                                if vp.len() == 1 {
-                                    let va = vp[0];
-                                    if let TypeData::GenericParam { index, .. } = self.get(vr).clone() {
-                                        if index == param_index {
-                                            // Yoneda branch: vp[0] ⇒ X → collect vp[0]
-                                            branch_inputs.push(va);
-                                            continue;
-                                        }
-                                    }
-                                    if let TypeData::GenericParam { index, .. } = self.get(va).clone() {
-                                        if index == param_index {
-                                            // co-Yoneda branch: X ⇒ vr → collect vr
-                                            branch_inputs.push(vr);
-                                            continue;
-                                        }
-                                    }
-                                }
+                    if let TypeData::Fn { params: ips, ret: ir } = self.get(inner).clone() {
+                        // Check ≡_X (Yoneda): ir = GenericParam(pi)
+                        let yoneda_match = match self.get(ir) {
+                            TypeData::GenericParam { index, .. } if *index == pi => true,
+                            _ => false,
+                        };
+                        // Check ≡_X (co-Yoneda): ips[0] = GenericParam(pi)
+                        let coyoneda_match = if !ips.is_empty() {
+                            match self.get(ips[0]) {
+                                TypeData::GenericParam { index, .. } if *index == pi => true,
+                                _ => false,
                             }
-                            // This variant doesn't match → can't reduce
-                            branch_inputs.clear();
-                            break;
+                        } else { false };
+                        // Process Yoneda case
+                        if yoneda_match {
+                            let product = if ips.len() == 1 { ips[0] }
+                                else { self.tuple(ips.clone()) };
+                            let repl = if inner_quantifiers.is_empty() { product }
+                                else {
+                                    let mut w = product;
+                                    for (eq, en) in &inner_quantifiers {
+                                        w = self.exists(en.clone(), w,
+                                            crate::ast::Expr::Literal(crate::ast::Literal::Bool(true),
+                                                crate::ast::Span::new(0, 0)));
+                                    }
+                                    w
+                                };
+                            branch_replacements.push(repl);
                         }
-                        if !branch_inputs.is_empty() {
-                            let product = if branch_inputs.len() == 1 {
-                                branch_inputs[0]
-                            } else {
-                                self.tuple(branch_inputs)
-                            };
-                            return self.replace_generic(ret, param_index, product);
+                        // Process co-Yoneda case
+                        if coyoneda_match {
+                            // The branch is X ⇒ A where A = inner_ret (not a param).
+                            // When ips.len() == 1, X is the only param and A = inner_ret.
+                            // When ips.len() > 1, the branch is X ⇒ A₁ ⇒ ... ⇒ Aⱼ
+                            // and the replacement is the return of the branch itself.
+                            let replacement = if ips.len() <= 1 { ir }
+                                else if ips.len() == 2 { ips[1] }
+                                else { self.tuple(ips[1..].to_vec()) };
+                            let repl = if inner_quantifiers.is_empty() { replacement }
+                                else {
+                                    let mut w = replacement;
+                                    for (_eq, en) in &inner_quantifiers {
+                                        w = self.forall(*_eq, en.clone(), w);
+                                    }
+                                    w
+                                };
+                            branch_replacements.push(repl);
                         }
                     }
                 }
+                if !branch_replacements.is_empty() {
+                    let sigma = if branch_replacements.len() == 1 { branch_replacements[0] }
+                        else { self.tuple(branch_replacements) };
+                    return self.replace_generic(ret, pi, sigma);
+                }
             }
-            return ty; // Forall node doesn't match Yoneda pattern
+            return ty;
         }
 
-        // Case B: implicit Fn-encoded pattern (backward compatible)
-        // ty = (A ⇒ X) ⇒ B  or  (X ⇒ A) ⇒ B
+        // ── Case B: implicit Fn-encoded pattern (backward compatible) ──
         let (inner, ret) = match self.get(ty) {
             TypeData::Fn { params, ret } if params.len() == 1 => (params[0], *ret),
             _ => return ty,
         };
-        // Match inner Fn structure: both single and multi-param
         if let TypeData::Fn { params: inner_params, ret: inner_ret } = self.get(inner).clone() {
-            // Case 1: inner_ret is GenericParam X → B[X ↦ A]
-            //   single inner param:  A = inner_params[0]
-            //   multi inner params:  A = (A₁, …, Aₙ) via currying
-            let inner_ret_is_x = match self.get(inner_ret) {
+            // ≡_X (Yoneda): inner_ret is GenericParam X
+            let yoneda_idx = match self.get(inner_ret) {
                 TypeData::GenericParam { index, .. } => Some(*index),
                 _ => None,
             };
-            if let Some(idx) = inner_ret_is_x {
-                let replacement = if inner_params.len() == 1 {
-                    inner_params[0]
-                } else {
-                    self.tuple(inner_params.clone())
-                };
+            if let Some(idx) = yoneda_idx {
+                let replacement = if inner_params.len() == 1 { inner_params[0] }
+                    else { self.tuple(inner_params.clone()) };
                 return self.replace_generic(ret, idx, replacement);
             }
-            // Case 2: inner_a (first inner param) is GenericParam X → B[X ↦ A] (co-Yoneda)
+            // ≡_X (co-Yoneda): first inner param is GenericParam X
             if !inner_params.is_empty() {
-                let first_is_x = match self.get(inner_params[0]) {
+                let coyoneda_idx = match self.get(inner_params[0]) {
                     TypeData::GenericParam { index, .. } => Some(*index),
                     _ => None,
                 };
-                if let Some(idx) = first_is_x {
+                if let Some(idx) = coyoneda_idx {
                     return self.replace_generic(ret, idx, inner_ret);
                 }
             }
         }
         ty
     }
-
-    /// Check that `param` only appears in positive (covariant) positions in `ty`.
-    /// Check whether all occurrences of `param` in `ty` appear only in
-    /// **positive** (covariant) positions. Uses sign propagation through
     /// the type tree (Pistone & Tranchini 2022 §2).
     fn check_positive_only(&self, param: usize, ty: TypeId) -> bool {
         self.check_variance(param, ty, 1)
@@ -1467,8 +1457,25 @@ impl TypeContext {
     /// 2. Add "axiom links" connecting matching GenericParam nodes.
     /// 3. Detect cyclic paths through the graph.
     /// 4. Acyclic → κ=0, cyclic only through covariant edges → κ=1, other → κ=∞.
+    ///
+    /// Uses KSP-style convergence detection (max 10 iterations) to handle
+    /// mutually recursive types where the characteristic may change across
+    /// successive rounds of refinement.
     pub fn characteristic(&self, ty: TypeId, visited: &mut Vec<TypeId>) -> Characteristic {
-        self.characteristic_with_variance(ty, visited, false)
+        const MAX_ITERATIONS: usize = 10;
+        let mut result = self.characteristic_with_variance(ty, visited, false);
+        for _iteration in 0..MAX_ITERATIONS {
+            let before = result;
+            // Re-run with the same visited to detect convergence:
+            // if the result stabilises, the cycle is resolved.
+            let mut re_visited = visited.clone();
+            result = self.characteristic_with_variance(ty, &mut re_visited, false);
+            if result == before {
+                break; // converged
+            }
+            *visited = re_visited;
+        }
+        result
     }
 
     /// Compute κ with scoped (remove+recover) visited tracking.
