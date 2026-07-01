@@ -7,6 +7,8 @@ mod hir {
     pub mod hir;
     pub mod infer;
     pub mod resolver;
+    pub mod shape_var;
+    pub mod smt;
     pub mod symbol;
     pub mod traits;
     pub mod types;
